@@ -209,5 +209,12 @@ SPECTACULAR_SETTINGS = {
                 "study programs, study stages and student groups."
             ),
         },
+        {
+            "name": "teaching",
+            "description": (
+                "Teaching structure: courses, course offerings, teaching components "
+                "and the student groups attending them."
+            ),
+        },
     ],
 }

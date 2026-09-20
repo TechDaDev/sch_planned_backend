@@ -16,11 +16,15 @@ from rest_framework import serializers
 from academics.models import (
     AcademicYear,
     College,
+    Course,
+    CourseOffering,
     Department,
     Semester,
     StudentGroup,
     StudyProgram,
     StudyStage,
+    TeachingComponent,
+    TeachingComponentGroup,
 )
 from academics.permissions import resolve_department_id, user_can_manage_department
 
@@ -332,3 +336,229 @@ class StudentGroupWriteSerializer(
     class Meta:
         model = StudentGroup
         fields = ("name", "code", "student_count", "stage", "parent_group", "is_active")
+
+
+# --- Phase 3: courses, offerings and teaching components ---------------------
+
+
+class CourseSummarySerializer(serializers.ModelSerializer):
+    """Compact course representation used in nested payloads."""
+
+    class Meta:
+        model = Course
+        fields = ("id", "name", "code")
+        read_only_fields = fields
+
+
+class SemesterSummarySerializer(serializers.ModelSerializer):
+    """Compact semester representation used in nested payloads."""
+
+    academic_year = AcademicYearSummarySerializer(read_only=True)
+
+    class Meta:
+        model = Semester
+        fields = ("id", "number", "academic_year")
+        read_only_fields = fields
+
+
+class CourseSerializer(serializers.ModelSerializer):
+    """Read representation of a course."""
+
+    department = DepartmentSummarySerializer(read_only=True)
+
+    class Meta:
+        model = Course
+        fields = (
+            "id",
+            "name",
+            "code",
+            "description",
+            "department",
+            "is_active",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = ("id", "created_at", "updated_at")
+
+
+class CourseWriteSerializer(DepartmentScopeWriteMixin, serializers.ModelSerializer):
+    """Write representation of a course (``department`` as a primary key)."""
+
+    department = serializers.PrimaryKeyRelatedField(queryset=Department.objects.all())
+
+    department_scope_fields = {"department": "pk"}
+
+    class Meta:
+        model = Course
+        fields = ("name", "code", "description", "department", "is_active")
+
+
+class CourseOfferingSummarySerializer(serializers.ModelSerializer):
+    """Compact offering representation used in nested payloads."""
+
+    course = CourseSummarySerializer(read_only=True)
+
+    class Meta:
+        model = CourseOffering
+        fields = ("id", "offering_code", "course")
+        read_only_fields = fields
+
+
+class CourseOfferingSerializer(serializers.ModelSerializer):
+    """Read representation of a course offering."""
+
+    course = CourseSummarySerializer(read_only=True)
+    semester = SemesterSummarySerializer(read_only=True)
+    managing_department = DepartmentSummarySerializer(read_only=True)
+    total_weekly_hours = serializers.DecimalField(
+        max_digits=6,
+        decimal_places=2,
+        read_only=True,
+    )
+
+    class Meta:
+        model = CourseOffering
+        fields = (
+            "id",
+            "offering_code",
+            "course",
+            "semester",
+            "managing_department",
+            "total_weekly_hours",
+            "is_active",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = ("id", "created_at", "updated_at")
+
+
+class CourseOfferingWriteSerializer(
+    ModelCleanValidationMixin,
+    DepartmentScopeWriteMixin,
+    serializers.ModelSerializer,
+):
+    """Write representation of a course offering.
+
+    ``managing_department`` must be the writer's own department, and the model
+    ``clean()`` requires it to be the department that owns the course — so a
+    foreign course cannot be hijacked by naming a different manager.
+    """
+
+    course = serializers.PrimaryKeyRelatedField(queryset=Course.objects.all())
+    semester = serializers.PrimaryKeyRelatedField(queryset=Semester.objects.all())
+    managing_department = serializers.PrimaryKeyRelatedField(
+        queryset=Department.objects.all()
+    )
+
+    department_scope_fields = {"managing_department": "pk"}
+
+    class Meta:
+        model = CourseOffering
+        fields = (
+            "course",
+            "semester",
+            "managing_department",
+            "offering_code",
+            "is_active",
+        )
+
+
+class TeachingComponentSummarySerializer(serializers.ModelSerializer):
+    """Compact teaching component representation used in nested payloads."""
+
+    class Meta:
+        model = TeachingComponent
+        fields = ("id", "component_type", "label")
+        read_only_fields = fields
+
+
+class TeachingComponentSerializer(serializers.ModelSerializer):
+    """Read representation of a teaching component."""
+
+    offering = CourseOfferingSummarySerializer(read_only=True)
+    sessions_per_week = serializers.IntegerField(read_only=True)
+
+    class Meta:
+        model = TeachingComponent
+        fields = (
+            "id",
+            "component_type",
+            "label",
+            "weekly_hours",
+            "session_duration_hours",
+            "sessions_per_week",
+            "offering",
+            "is_active",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = ("id", "created_at", "updated_at")
+
+
+class TeachingComponentWriteSerializer(
+    ModelCleanValidationMixin,
+    DepartmentScopeWriteMixin,
+    serializers.ModelSerializer,
+):
+    """Write representation of a teaching component.
+
+    Components may only be written for an offering managed by the writer's
+    department; participating departments stay read-only.
+    """
+
+    offering = serializers.PrimaryKeyRelatedField(queryset=CourseOffering.objects.all())
+
+    department_scope_fields = {"offering": "managing_department"}
+
+    class Meta:
+        model = TeachingComponent
+        fields = (
+            "offering",
+            "component_type",
+            "label",
+            "weekly_hours",
+            "session_duration_hours",
+            "is_active",
+        )
+
+
+class TeachingComponentGroupSerializer(serializers.ModelSerializer):
+    """Read representation of a teaching component / student group relation."""
+
+    teaching_component = TeachingComponentSummarySerializer(read_only=True)
+    student_group = StudentGroupSummarySerializer(read_only=True)
+
+    class Meta:
+        model = TeachingComponentGroup
+        fields = ("id", "teaching_component", "student_group", "created_at")
+        read_only_fields = fields
+
+
+class TeachingComponentGroupWriteSerializer(
+    ModelCleanValidationMixin,
+    DepartmentScopeWriteMixin,
+    serializers.ModelSerializer,
+):
+    """Write representation of a teaching component / student group relation.
+
+    A department administrator can only link a component of an offering they
+    manage and a student group of their own department; enrolling another
+    department's students into a joint course is reserved for college
+    administrators and superusers.
+    """
+
+    teaching_component = serializers.PrimaryKeyRelatedField(
+        queryset=TeachingComponent.objects.all()
+    )
+    student_group = serializers.PrimaryKeyRelatedField(
+        queryset=StudentGroup.objects.all()
+    )
+
+    department_scope_fields = {
+        "teaching_component": "offering__managing_department",
+        "student_group": "stage__program__department",
+    }
+
+    class Meta:
+        model = TeachingComponentGroup
+        fields = ("teaching_component", "student_group")

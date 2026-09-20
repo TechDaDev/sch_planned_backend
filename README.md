@@ -4,8 +4,8 @@ Django REST Framework backend for the College Academic Schedule Planner.
 Provides the project foundation (configuration package, domain app skeletons,
 custom user model, API/OpenAPI plumbing) that later phases build on.
 
-- Current phase: **Phase 2 — academic structure** (no courses, rooms or
-  scheduling yet).
+- Current phase: **Phase 3 — courses and teaching structure** (no instructors,
+  rooms or scheduling yet).
 
 ## Architecture
 
@@ -26,12 +26,15 @@ sch_planner_backend/
 │   └── urls.py        # /api/auth/*, /api/me/
 ├── academics/         # academic structure
 │   ├── models.py      # College, Department, AcademicYear, Semester,
-│   │                  # StudyProgram, StudyStage, StudentGroup
-│   ├── permissions.py # Phase 2 role/department permissions
+│   │                  # StudyProgram, StudyStage, StudentGroup,
+│   │                  # Course, CourseOffering, TeachingComponent,
+│   │                  # TeachingComponentGroup
+│   ├── permissions.py # role, department and joint-teaching visibility rules
 │   ├── serializers.py # read/write serializers + nested summaries
 │   ├── views.py       # DRF viewsets (no hard delete)
-│   ├── urls.py        # /api/colleges/, /api/departments/, ...
-│   └── migrations/    # 0001_initial (Phase 1), 0002_academic_structure
+│   ├── urls.py        # /api/colleges/, /api/departments/, /api/courses/, ...
+│   └── migrations/    # 0001_initial, 0002_academic_structure,
+│                      # 0003_teaching_structure
 ├── resources/         # rooms, time resources (empty until later phases)
 ├── scheduling/        # schedules and solving (empty until later phases)
 ├── reports/           # report exports (empty until later phases)
@@ -44,9 +47,11 @@ sch_planner_backend/
 └── README.md
 ```
 
-Phase 2 adds the academic hierarchy and the college-wide calendar. Courses,
-course offerings, teaching components, instructors as academic resources,
-rooms/labs and scheduling are still unimplemented.
+Phase 3 adds the teaching structure (courses, offerings, teaching components
+and the groups attending them). Instructors, instructor availability, rooms,
+laboratories and scheduling are still unimplemented:
+instructor assignment arrives in **Phase 4**, room/lab assignment in
+**Phase 5**, timetable generation later.
 
 ## Requirements
 
@@ -105,18 +110,22 @@ Run the development server:
 | POST   | `/api/auth/refresh/` | public        | Refresh an access token            |
 | GET    | `/api/me/`           | authenticated | Current user identity, role, dept. |
 | GET    | `/api/schema/`       | public        | OpenAPI 3 schema                   |
-| GET    | `/api/docs/`         | public        | Swagger UI for the schema          |
+| GET    | `and Phase 3 resources expose the same five operations — `GET` list,
+`GET` detail, `POST`, `PUT`, `PATCH`:
 
-All Phase 2 resources expose the same five operations — `GET` list, `GET`
-detail, `POST`, `PUT`, `PATCH`:
-
-| Resource          | Path                    | Department scope path                 |
-| ----------------- | ----------------------- | ------------------------------------- |
-| Colleges          | `/api/colleges/`        | college-wide                          |
-| Departments       | `/api/departments/`     | the department itself                 |
-| Academic years    | `/api/academic-years/`  | college-wide                          |
-| Semesters         | `/api/semesters/`       | college-wide                          |
-| Study programs    | `/api/programs/`        | `program.department`                  |
+| Resource                  | Path                               | Department scope path                 |
+| ------------------------- | ---------------------------------- | ------------------------------------- |
+| Colleges                  | `/api/colleges/`                   | college-wide                          |
+| Departments               | `/api/departments/`                | the department itself                 |
+| Academic years            | `/api/academic-years/`             | college-wide                          |
+| Semesters                 | `/api/semesters/`                  | college-wide                          |
+| Study programs            | `/api/programs/`                   | `program.department`                  |
+| Study stages              | `/api/stages/`                     | `stage.program.department`            |
+| Student groups            | `/api/student-groups/`             | `group.stage.program.department`      |
+| Courses                   | `/api/courses/`                    | `course.department` (+ joint teaching) |
+| Course offerings          | `/api/course-offerings/`           | managing department (+ joint teaching) |
+| Teaching components       | `/api/teaching-components/`        | offering's managing department (+ joint) |
+| Teaching component groups | `/api/teaching-component-groups/`  | component *and* student group          |
 | Study stages      | `/api/stages/`          | `stage.program.department`            |
 | Student groups    | `/api/student-groups/`  | `group.stage.program.department`      |
 
@@ -273,24 +282,86 @@ without a department.
 `study_type` is a stable enum (`academics.StudyType`): `UNDERGRADUATE`,
 `MASTER`, `PHD`. Arbitrary free-text study types are not accepted.
 
+## Teaching structure
+
+Courses are reusable catalog definitions; actual delivery lives on offerings and
+their components.
+
+```
+Course                     CourseOffering                     TeachingComponent
+Machine Learning (ML301) → 2026-2027 · Sem 1 · [MAIN]      →  THEORY     4h/week, 2h sessions
+                                                              PRACTICAL  3h/week, 1.5h sessions
+                                                                   ↓
+                                          TeachingComponentGroup → StudentGroup (or subgroup)
+```
+
+| Model | Key fields | Notable rules |
+| --- | --- | --- |
+| `Course` | `department`, `name`, `code`, `description`, `is_active`, timestamps | `(department, code)` unique; holds no professor, hours, room, year or semester data — the catalog entry is reusable |
+| `CourseOffering` | `course`, `semester`, `managing_department`, `offering_code` (default `MAIN`), `is_active`, timestamps | `(course, semester, offering_code)` unique — several offerings per semester are possible; `managing_department` must be the department that owns the course; the academic year comes from `semester`; `total_weekly_hours` is derived from the active components |
+| `TeachingComponent` | `offering`, `component_type`, `label`, `weekly_hours`, `session_duration_hours`, `is_active`, timestamps | type is `THEORY` or `PRACTICAL`; hours are `DECIMAL` (never binary floating point) and must be `> 0`; the session count must be whole; `sessions_per_week` is derived and never stored |
+| `TeachingComponentGroup` | `teaching_component`, `student_group`, `created_at` | `(teaching_component, student_group)` unique; one component may not contain a group together with its ancestor or descendant |
+
+### Weekly hours, session duration, sessions per week
+
+| `weekly_hours` | `session_duration_hours` | `sessions_per_week` |
+| --- | --- | --- |
+| 4 | 2 | 2 |
+| 3 | 1.5 | 2 |
+| 2.5 | 0.5 | 5 |
+| 3 | 2 | rejected (`400`) — would be 1.5 sessions |
+
+Invalid combinations are rejected with `400` and never silently rounded.
+`total_weekly_hours` on an offering sums the weekly hours of its **active**
+components only.
+
+### Which groups attend a component
+
+`TeachingComponentGroup` is an explicit resource rather than an implicit M2M
+table because it carries authorization and validation. It expresses:
+
+- **single class** — component → Group A
+- **combined groups** — component → Group A + Group B (one shared lecture)
+- **practical subgroups** — practical component 1 → A1, practical component 2 → A2
+- **joint inter-department courses** — one component → groups from several
+  departments' stages
+
+Within one component a group may not be combined with its own ancestor or
+descendant (that would represent the same students twice); siblings and
+unrelated groups are valid.
+
+### Joint courses
+
+An offering has exactly one `managing_department` (the course owner). Groups
+from other departments may attend its components. Those departments can **read**
+the course, offering, component and relation rows, but never write them; linking
+another department's student group is reserved for `COLLEGE_ADMIN`/superusers so
+one department cannot unilaterally enrol another department's students.
+
 ## Who may write what
 
 | Role | Reads | Writes |
 | --- | --- | --- |
-| `COLLEGE_ADMIN` or Django superuser | everything | everything, including colleges, academic years and semesters |
-| `DEPARTMENT_ADMIN` | own department hierarchy | own department: update it, and manage programs, stages and groups inside it |
-| `SCHEDULER`, `VIEWER`, `INSTRUCTOR` | own department hierarchy | none — academic structure is read-only for these roles |
+| `COLLEGE_ADMIN` or Django superuser | everything | everything, including colleges, academic years, semesters and joint-course group associations |
+| `DEPARTMENT_ADMIN` | own department plus joint components their students attend | own department: update it, and manage programs, stages, groups, courses, offerings, components and component/group links (only groups of their own department) |
+| `SCHEDULER`, `VIEWER`, `INSTRUCTOR` | own department plus joint components their students attend | none — academic and teaching structure is read-only for these roles |
 
-Every endpoint requires authentication. Department-scoped reads return only the
-caller's department: out-of-scope detail requests answer `404` rather than
-revealing that a record exists, and a department-scoped user with no department
-sees an empty result set. Writes are authorised from `request.user` and the
-persisted relationships, so a client cannot move a program, stage or group into
-another department by sending a different foreign-key id.
+Every endpoint requires authentication. Department-scoped reads return only what
+the caller's department owns **or participates in**: out-of-scope detail requests
+answer `404` rather than revealing that a record exists, and a department-scoped
+user with no department sees an empty result set. Writes are authorised from
+`request.user` and the persisted relationships, so a client cannot move a
+course, offering or component into another department — or attach a foreign
+student group — by sending different foreign-key ids.
+
+No endpoint exposes `DELETE`: detail routes answer `405` and lifecycle is managed
+with `is_active` (`TeachingComponentGroup` is a relation rather than a lifecycle
+record; it is currently maintained through the Django admin).
 
 Permission classes live in `academics/permissions.py`:
-`IsCollegeAdminOrReadOnly`, `CanManageDepartments` and
-`IsDepartmentScopedWriter`.
+`IsCollegeAdminOrReadOnly`, `CanManageDepartments`, `IsDepartmentScopedWriter`
+and, for the Phase 3 teaching resources, `IsDepartmentScopedManager` together
+with the `visible_*_filter` helpers.
 
 ## Timezone
 
@@ -324,7 +395,14 @@ not used.
 - **Phase 2 (done)** — `College`, expanded `Department`, `AcademicYear`,
   `Semester`, `StudyProgram`, `StudyStage`, `StudentGroup` with optional
   subgroups, plus the scoped REST API, permissions and admin.
-- **Next** — courses, course offerings, teaching components, instructors and
-  rooms/labs.
-- **Later** — schedule generation (OR-Tools), reports/export, PostgreSQL,
+- **Phase 3 (done)** — `Course`, `CourseOffering`, `TeachingComponent` and
+  `TeachingComponentGroup`: theory/practical weekly hours, derived session
+  counts, combined groups, practical subgroups and joint inter-department
+  courses.
+- **Phase 4 (planned)** — instructors: `InstructorProfile`,
+  `InstructorDepartmentAccess`, availability and preferences, and instructor
+  assignment to teaching components.
+- **Phase 5 (planned)** — rooms and laboratories, room requirements and
+  assignment.
+- **Later** — timetable generation (OR-Tools), reports/export, PostgreSQL,
   background jobs, deployment.

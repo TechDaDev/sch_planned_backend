@@ -1,4 +1,4 @@
-"""Phase 2 permission classes for the academic structure API.
+"""Phase 2 and Phase 3 permission classes for the academic structure API.
 
 These build on the Phase 1 role model: ``COLLEGE_ADMIN`` (plus Django
 superusers) may manage the whole college, ``DEPARTMENT_ADMIN`` may manage the
@@ -6,10 +6,16 @@ academic structure of their own department, and the remaining roles are
 read-only. Every check fails closed for users without the required role or
 without a department.
 
+Phase 3 adds joint teaching, where a record may legitimately be *visible* to a
+department that does not manage it (another department's students attend the
+component). The ``visible_*_filter`` helpers express that read rule, while
+writes stay restricted to the managing department.
+
 Queryset scoping in ``academics.views`` mirrors these rules so out-of-scope
 records answer 404 instead of leaking their existence.
 """
 
+from django.db import models
 from rest_framework.permissions import SAFE_METHODS, BasePermission
 
 from accounts.permissions import IsCollegeAdmin, is_authenticated_active_user
@@ -121,7 +127,83 @@ class IsDepartmentScopedWriter(BasePermission):
 __all__ = [
     "CanManageDepartments",
     "IsCollegeAdminOrReadOnly",
+    "IsDepartmentScopedManager",
     "IsDepartmentScopedWriter",
     "resolve_department_id",
     "user_can_manage_department",
+    "visible_components_filter",
+    "visible_courses_filter",
+    "visible_group_links_filter",
+    "visible_offerings_filter",
 ]
+
+
+class IsDepartmentScopedManager(BasePermission):
+    """Write access for the department that manages a joint-teaching record.
+
+    Reads are open to any authenticated, active user (queryset scoping decides
+    what is actually visible). Writes require a college administrator or
+    Django superuser, or a department administrator whose own department
+    satisfies **every** lookup declared by the view through
+    ``management_department_lookups``.
+
+    Declaring several lookups covers relations that must be in scope on both
+    sides: a ``TeachingComponentGroup`` is only manageable when the component's
+    offering *and* the student group both belong to the writer's department.
+    """
+
+    def has_permission(self, request, view) -> bool:
+        if not is_authenticated_active_user(request):
+            return False
+        if request.method in SAFE_METHODS:
+            return True
+        user = request.user
+        return user.has_cross_department_access or (
+            user.is_department_admin and user.department_id is not None
+        )
+
+    def has_object_permission(self, request, view, obj) -> bool:
+        if request.method in SAFE_METHODS:
+            return True
+        user = request.user
+        if user.has_cross_department_access:
+            return True
+        if not (user.is_department_admin and user.department_id is not None):
+            return False
+        lookups = getattr(view, "management_department_lookups", ("department",))
+        return all(
+            resolve_department_id(obj, lookup) == user.department_id
+            for lookup in lookups
+        )
+
+
+def visible_courses_filter(user) -> models.Q:
+    """Courses a department-scoped user may read.
+
+    Either the course belongs to their department, or it is taught to their
+    students through a joint offering/component (Phase 3 joint courses).
+    """
+    return models.Q(department=user.department_id) | models.Q(
+        offerings__components__group_links__student_group__stage__program__department=user.department_id
+    )
+
+
+def visible_offerings_filter(user) -> models.Q:
+    """Offerings managed by the user's department or attended by its students."""
+    return models.Q(managing_department=user.department_id) | models.Q(
+        components__group_links__student_group__stage__program__department=user.department_id
+    )
+
+
+def visible_components_filter(user) -> models.Q:
+    """Components of offerings managed by the user's department or attending it."""
+    return models.Q(offering__managing_department=user.department_id) | models.Q(
+        group_links__student_group__stage__program__department=user.department_id
+    )
+
+
+def visible_group_links_filter(user) -> models.Q:
+    """Component/group relations that touch the user's department."""
+    return models.Q(
+        teaching_component__offering__managing_department=user.department_id
+    ) | models.Q(student_group__stage__program__department=user.department_id)

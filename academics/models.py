@@ -1,18 +1,25 @@
 """
 Academics models.
 
-Phase 1 introduced the minimal ``Department``. Phase 2 adds the academic
+Phase 1 introduced the minimal ``Department``. Phase 2 added the academic
 hierarchy — ``College`` -> ``Department`` -> ``StudyProgram`` -> ``StudyStage``
 -> ``StudentGroup`` (with optional subgroups) — plus the college-wide calendar
 (``AcademicYear``, ``Semester``).
 
-Courses, course offerings, instructors, rooms and scheduling are not part of
-this phase.
+Phase 3 adds the teaching structure: ``Course`` (catalog definition),
+``CourseOffering`` (one delivery in a semester), ``TeachingComponent``
+(theory/practical parts with weekly hours) and ``TeachingComponentGroup``
+(which groups attend a component, including combined and joint
+inter-department teaching).
+
+Instructors, rooms and scheduling remain out of scope.
 
 Timestamps are timezone-aware: ``USE_TZ = True`` with ``Asia/Baghdad`` as the
 application timezone (see ``config/settings.py``). No manual UTC offsets are
 applied anywhere in this module.
 """
+
+from decimal import Decimal
 
 from django.core.exceptions import ValidationError
 from django.core.validators import MinValueValidator
@@ -317,5 +324,284 @@ class StudentGroup(models.Model):
             current = current.parent_group
         return False
 
+    def ancestor_ids(self) -> set[int]:
+        """Return the primary keys of the parent chain above this group."""
+        ancestors: set[int] = set()
+        current = self.parent_group
+        while current is not None and current.pk not in ancestors:
+            ancestors.add(current.pk)
+            current = current.parent_group
+        return ancestors
+
     def __str__(self) -> str:
         return f"{self.name} ({self.code})"
+
+
+class Course(models.Model):
+    """Catalog definition of a course owned by a department.
+
+    Delivery details (semester, hours, groups, instructors, rooms) deliberately
+    live on ``CourseOffering`` and ``TeachingComponent`` so the catalog entry can
+    be reused across semesters.
+    """
+
+    department = models.ForeignKey(
+        Department,
+        on_delete=models.PROTECT,
+        related_name="courses",
+        help_text="Department that owns the course academically.",
+    )
+    name = models.CharField(max_length=150)
+    code = models.CharField(
+        max_length=20,
+        help_text="Course code, for example ML301 or BIO102.",
+    )
+    description = models.TextField(blank=True, default="")
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ("code",)
+        verbose_name = "course"
+        verbose_name_plural = "courses"
+        constraints = [
+            models.UniqueConstraint(
+                fields=("department", "code"),
+                name="unique_course_code_per_department",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.name} ({self.code})"
+
+
+class CourseOffering(models.Model):
+    """One delivery of a course in a semester.
+
+    The offering's semester already determines the academic year, so no
+    redundant academic-year field is stored here.
+    """
+
+    course = models.ForeignKey(
+        Course,
+        on_delete=models.PROTECT,
+        related_name="offerings",
+    )
+    semester = models.ForeignKey(
+        Semester,
+        on_delete=models.PROTECT,
+        related_name="course_offerings",
+    )
+    managing_department = models.ForeignKey(
+        Department,
+        on_delete=models.PROTECT,
+        related_name="managed_course_offerings",
+        help_text="Department responsible for delivering the offering.",
+    )
+    offering_code = models.CharField(
+        max_length=20,
+        default="MAIN",
+        help_text="Short instance label, for example MAIN, A or EVENING.",
+    )
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ("course__code", "offering_code")
+        verbose_name = "course offering"
+        verbose_name_plural = "course offerings"
+        constraints = [
+            models.UniqueConstraint(
+                fields=("course", "semester", "offering_code"),
+                name="unique_offering_code_per_course_semester",
+            ),
+        ]
+
+    @property
+    def total_weekly_hours(self) -> Decimal:
+        """Weekly hours of the offering's active teaching components.
+
+        Uses ``active_components`` when the queryset prefetched it, so list
+        endpoints stay free of N+1 queries.
+        """
+        components = getattr(self, "active_components", None)
+        if components is None:
+            components = self.components.filter(is_active=True)
+        return sum(
+            (component.weekly_hours for component in components),
+            Decimal("0.00"),
+        )
+
+    def clean(self):
+        super().clean()
+        if self.course_id and self.managing_department_id:
+            if self.course.department_id != self.managing_department_id:
+                raise ValidationError(
+                    {
+                        "managing_department": (
+                            "The managing department must be the department that owns the course."
+                        )
+                    }
+                )
+
+    def __str__(self) -> str:
+        return f"{self.course} — {self.semester} [{self.offering_code}]"
+
+
+class TeachingComponentType(models.TextChoices):
+    """Teaching component kinds. Further kinds can be added without redesign."""
+
+    THEORY = "THEORY", "Theory"
+    PRACTICAL = "PRACTICAL", "Practical"
+
+
+class TeachingComponent(models.Model):
+    """A theoretical or practical part of a course offering.
+
+    ``sessions_per_week`` is derived from the hours and never stored.
+    """
+
+    offering = models.ForeignKey(
+        CourseOffering,
+        on_delete=models.PROTECT,
+        related_name="components",
+    )
+    component_type = models.CharField(
+        max_length=20,
+        choices=TeachingComponentType.choices,
+    )
+    label = models.CharField(
+        max_length=100,
+        blank=True,
+        default="",
+        help_text="Human-readable label; not semantically authoritative.",
+    )
+    weekly_hours = models.DecimalField(max_digits=5, decimal_places=2)
+    session_duration_hours = models.DecimalField(max_digits=5, decimal_places=2)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ("offering", "component_type", "label")
+        verbose_name = "teaching component"
+        verbose_name_plural = "teaching components"
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(weekly_hours__gt=0),
+                name="teaching_component_weekly_hours_positive",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(session_duration_hours__gt=0),
+                name="teaching_component_session_duration_positive",
+            ),
+        ]
+
+    @property
+    def sessions_per_week(self) -> int | None:
+        """Whole number of weekly sessions, or None until both hours are set."""
+        if not self.weekly_hours or not self.session_duration_hours:
+            return None
+        return int(self.weekly_hours / self.session_duration_hours)
+
+    def clean(self):
+        """Require positive hours that divide into whole weekly sessions."""
+        super().clean()
+        errors = {}
+        weekly_hours = self.weekly_hours
+        session_duration = self.session_duration_hours
+
+        if weekly_hours is not None and weekly_hours <= 0:
+            errors["weekly_hours"] = "Weekly hours must be greater than zero."
+        if session_duration is not None and session_duration <= 0:
+            errors["session_duration_hours"] = (
+                "Session duration must be greater than zero."
+            )
+
+        if not errors and weekly_hours is not None and session_duration is not None:
+            if weekly_hours < session_duration:
+                errors["weekly_hours"] = (
+                    "Weekly hours must be at least one session duration."
+                )
+            else:
+                sessions = weekly_hours / session_duration
+                if sessions != sessions.to_integral_value():
+                    errors["session_duration_hours"] = (
+                        "Session duration must divide the weekly hours into whole "
+                        "sessions; rounding is not applied."
+                    )
+
+        if errors:
+            raise ValidationError(errors)
+
+    def __str__(self) -> str:
+        label = self.label or self.get_component_type_display()
+        return f"{self.offering} — {label}"
+
+
+class TeachingComponentGroup(models.Model):
+    """Attaches a student group (or subgroup) to a teaching component.
+
+    One component may serve several groups: combined lecture groups, practical
+    subgroups and joint inter-department courses are all expressed here.
+    """
+
+    teaching_component = models.ForeignKey(
+        TeachingComponent,
+        on_delete=models.PROTECT,
+        related_name="group_links",
+    )
+    student_group = models.ForeignKey(
+        StudentGroup,
+        on_delete=models.PROTECT,
+        related_name="component_links",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("teaching_component", "student_group")
+        verbose_name = "teaching component group"
+        verbose_name_plural = "teaching component groups"
+        constraints = [
+            models.UniqueConstraint(
+                fields=("teaching_component", "student_group"),
+                name="unique_group_per_teaching_component",
+            ),
+        ]
+
+    def clean(self):
+        """Reject overlapping group hierarchies inside one component.
+
+        A component must not hold a group and one of its ancestors or
+        descendants, because those students would be represented twice.
+        """
+        super().clean()
+        if self.teaching_component_id is None or self.student_group_id is None:
+            return
+
+        group = self.student_group
+        ancestor_ids = group.ancestor_ids()
+        conflicts = self.teaching_component.group_links.exclude(pk=self.pk)
+
+        for link in conflicts.select_related("student_group"):
+            other = link.student_group
+            if other.pk == group.pk:
+                message = "This group is already attached to the teaching component."
+            elif other.pk in ancestor_ids:
+                message = (
+                    "A teaching component cannot contain both a group and one of its "
+                    "ancestor groups."
+                )
+            elif group.pk in other.ancestor_ids():
+                message = (
+                    "A teaching component cannot contain both a group and one of its "
+                    "descendant groups."
+                )
+            else:
+                continue
+            raise ValidationError({"student_group": message})
+
+    def __str__(self) -> str:
+        return f"{self.teaching_component} → {self.student_group}"
