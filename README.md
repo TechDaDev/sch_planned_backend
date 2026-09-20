@@ -4,8 +4,8 @@ Django REST Framework backend for the College Academic Schedule Planner.
 Provides the project foundation (configuration package, domain app skeletons,
 custom user model, API/OpenAPI plumbing) that later phases build on.
 
-- Current phase: **Phase 3 — courses and teaching structure** (no instructors,
-  rooms or scheduling yet).
+- Current phase: **Phase 4 — instructor resources and teaching assignments**
+  (no rooms, time slots or timetable generation yet).
 
 ## Architecture
 
@@ -28,22 +28,30 @@ sch_planner_backend/
 │   ├── models.py      # College, Department, AcademicYear, Semester,
 │   │                  # StudyProgram, StudyStage, StudentGroup,
 │   │                  # Course, CourseOffering, TeachingComponent,
-│   │                  # TeachingComponentGroup
+│   │                  # TeachingComponentGroup, Weekday (Sunday→Thursday)
 │   ├── permissions.py # role, department and joint-teaching visibility rules
 │   ├── serializers.py # read/write serializers + nested summaries
 │   ├── views.py       # DRF viewsets (no hard delete)
 │   ├── urls.py        # /api/colleges/, /api/departments/, /api/courses/, ...
 │   └── migrations/    # 0001_initial, 0002_academic_structure,
 │                      # 0003_teaching_structure
-├── resources/         # rooms, time resources (empty until later phases)
-├── scheduling/        # schedules and solving (empty until later phases)
+├── resources/         # instructors and their teaching assignments
+│   ├── models.py      # InstructorProfile, InstructorDepartmentAccess,
+│   │                  # InstructorAvailability, InstructorPreference,
+│   │                  # TeachingAssignment
+│   ├── permissions.py # instructor read-visibility rules
+│   ├── serializers.py # read/write serializers + summaries
+│   ├── views.py       # viewsets + /api/me/teaching-assignments/
+│   ├── urls.py        # /api/instructors/, /api/teaching-assignments/, ...
+│   └── migrations/    # 0001_initial
+├── scheduling/        # time slots and solving (empty until later phases)
 ├── reports/           # report exports (empty until later phases)
 ├── tests/             # pytest suite for the whole project
-├── manage.py
-├── requirements.txt
-├── pytest.ini
-├── .env.example
-├── .gitignore
+├── ma4 adds instructors as schedulable resources with department sharing,
+weekly availability, soft preferences and teaching assignments. Rooms and
+laboratories belong to **Phase 5**; calendar/time slots, timetable generation
+(OR-Tools) and reports come later. The Flutter instructor app follows the web
+application
 └── README.md
 ```
 
@@ -109,9 +117,12 @@ Run the development server:
 | POST   | `/api/auth/login/`   | public        | Obtain JWT access/refresh tokens   |
 | POST   | `/api/auth/refresh/` | public        | Refresh an access token            |
 | GET    | `/api/me/`           | authenticated | Current user identity, role, dept. |
+| GET    | `/api/me/teaching-assignments/` | authenticated | Own active teaching assignments |
 | GET    | `/api/schema/`       | public        | OpenAPI 3 schema                   |
-| GET    | `and Phase 3 resources expose the same five operations — `GET` list,
-`GET` detail, `POST`, `PUT`, `PATCH`:
+| GET    | `/api/docs/`         | public        | Swagger UI for the schema          |
+
+All resource APIs expose the same five operations — `GET` list, `GET` detail,
+`POST`, `PUT`, `PATCH`:
 
 | Resource                  | Path                               | Department scope path                 |
 | ------------------------- | ---------------------------------- | ------------------------------------- |
@@ -126,8 +137,19 @@ Run the development server:
 | Course offerings          | `/api/course-offerings/`           | managing department (+ joint teaching) |
 | Teaching components       | `/api/teaching-components/`        | offering's managing department (+ joint) |
 | Teaching component groups | `/api/teaching-component-groups/`  | component *and* student group          |
-| Study stages      | `/api/stages/`          | `stage.program.department`            |
-| Student groups    | `/api/student-groups/`  | `group.stage.program.department`      |
+| Instructor profiles       | `/api/instructors/`                | `instructor.primary_department` (+ sharing) |
+| Instructor access grants  | `/api/instructor-department-access/` | grant's instructor primary department |
+| Instructor availability   | `/api/instructor-availability/`    | availability's instructor primary department |
+| Instructor preferences    | `/api/instructor-preferences/`     | preference's instructor primary department |
+| Teaching assignments      | `/api/teaching-assignments/`       | component's offering managing department |
+
+Write ownership in this table is stricter than read visibility for instructors:
+shared instructors are readable by the departments they are shared with, and
+joint-course instructors are readable by participating departments, but writes
+always stay with the owning (primary) department. Simple exact-match query
+filters are available on the instructor resources (`primary_department`,
+`sharing_scope`, `instructor`, `semester`, `day_of_week`, `preference_type`,
+`assignment_role`, `is_active`); invalid filter values answer `400`.
 
 `DELETE` is intentionally not part of the API: the detail routes exist but
 answer **405 Method Not Allowed**. Lifecycle is managed with `is_active`.
@@ -338,30 +360,103 @@ the course, offering, component and relation rows, but never write them; linking
 another department's student group is reserved for `COLLEGE_ADMIN`/superusers so
 one department cannot unilaterally enrol another department's students.
 
+## Instructor resources
+
+Instructors are first-class academic resources: an `InstructorProfile` is what
+gets scheduled, while `accounts.User` remains the authentication identity. A
+profile is valid **without** an account, so instructors can be entered
+administratively long before logins exist.
+
+| Model | Key fields | Notable rules |
+| --- | --- | --- |
+| `InstructorProfile` | `primary_department`, `full_name`, `staff_code`, `academic_title`, `user` (optional), `max_weekly_hours`, `max_daily_hours`, `sharing_scope`, `is_active`, timestamps | `staff_code` unique when present (blank is stored as `NULL`, so many instructors may have none); limits must be `> 0` with `max_daily_hours <= max_weekly_hours`; a linked account must already hold the `INSTRUCTOR` role and belong to the primary department — linking never mutates the account |
+| `InstructorDepartmentAccess` | `instructor`, `department`, `is_active`, timestamps | one row per instructor/department; the primary department cannot be granted (it already has inherent access) |
+| `InstructorAvailability` | `instructor`, `semester`, `day_of_week`, `start_time`, `end_time`, `is_active`, timestamps | recurring **hard** availability; `start_time < end_time`; active windows may not overlap on the same weekday (adjacent boundaries are fine, exact duplicates are blocked by a partial unique index) |
+| `InstructorPreference` | as availability plus `preference_type` (`PREFERRED`/`AVOID`), timestamps | **soft** preference: `AVOID` is not unavailability; same window and overlap rules |
+| `TeachingAssignment` | `teaching_component`, `instructor`, `assignment_role` (`PRIMARY`/`ASSISTANT`), `is_active`, timestamps | one row per instructor/component; at most **one active `PRIMARY`** per component (partial unique index); multiple assistants are allowed |
+
+The college week is **Sunday → Thursday** (`academics.Weekday`, shared with the
+later calendar/time-slot phase). Absence of availability rows means
+"availability not configured", never "unrestricted" — the pre-scheduling
+validation phase decides what to do about that.
+
+### Sharing scopes
+
+| Scope | Meaning |
+| --- | --- |
+| `PRIVATE` (default) | may teach only in the primary department |
+| `SELECTED_DEPARTMENTS` | may also teach in departments holding an **active** `InstructorDepartmentAccess` row |
+| `COLLEGE_WIDE` | may teach in any active department |
+
+`InstructorProfile.can_teach_in_department(department)` is the single eligibility
+helper reused by assignment validation (inactive instructor → never; primary
+department → always; `PRIVATE` → nothing else; `SELECTED_DEPARTMENTS` → active
+grant required; `COLLEGE_WIDE` → active department). It applies to **every**
+writer, including college administrators, who must adjust sharing first.
+Changing a scope never deletes stored access rows; a non-selected scope simply
+ignores them.
+
+### Teaching assignments
+
+`TeachingAssignment` links an instructor to a `TeachingComponent` — no
+instructor fields were added to `Course` or `TeachingComponent`. Active
+assignments require an active instructor, component, offering and course, plus
+eligibility for the offering's managing department:
+
+```
+Dr. Ahmed — primary: Computer Science, scope: SELECTED_DEPARTMENTS
+  access grant: Biomedical Applications
+  → assignment to "Programming for Biomedical Applications"
+    (managing department: Biomedical Applications)        accepted
+
+Same instructor, no access grant                           rejected (400)
+```
+
+`GET /api/me/teaching-assignments/` returns the active assignments of the
+instructor linked to the authenticated account, and `[]` when the account has no
+instructor profile. It prepares the future Flutter instructor app; it is not a
+timetable endpoint.
+
+### Availability vs. instructor visibility
+
+Availability and preferences are readable by the primary department and by
+departments the instructor is actually shared with — **not** merely because the
+instructor teaches one joint course. A participating department sees who teaches
+the joint course (read-only) but cannot assign that instructor elsewhere, and
+cannot inspect their full weekly availability.
+
 ## Who may write what
 
 | Role | Reads | Writes |
 | --- | --- | --- |
-| `COLLEGE_ADMIN` or Django superuser | everything | everything, including colleges, academic years, semesters and joint-course group associations |
-| `DEPARTMENT_ADMIN` | own department plus joint components their students attend | own department: update it, and manage programs, stages, groups, courses, offerings, components and component/group links (only groups of their own department) |
-| `SCHEDULER`, `VIEWER`, `INSTRUCTOR` | own department plus joint components their students attend | none — academic and teaching structure is read-only for these roles |
+| `COLLEGE_ADMIN` or Django superuser | everything | everything: colleges, academic years, semesters, joint-course group associations, instructor profiles, sharing grants, availability, preferences and assignments |
+| `DEPARTMENT_ADMIN` | own department plus joint components their students attend and instructors shared with them | own department: update it; manage programs, stages, groups, courses, offerings, components, component/group links (own groups only), instructor profiles, sharing grants, availability and preferences; assignments on components their department manages, choosing own or eligible shared instructors |
+| `SCHEDULER`, `VIEWER`, `INSTRUCTOR` | own department plus joint components their students attend, and instructors shared with them | none — academic, teaching and instructor structure is read-only for these roles |
+
+A department can never modify a shared instructor profile, inspect availability
+that is not shared with it, grant itself access to a foreign instructor, or
+assign an ineligible instructor — sharing changes are always made by the owning
+department (or a college administrator).
 
 Every endpoint requires authentication. Department-scoped reads return only what
 the caller's department owns **or participates in**: out-of-scope detail requests
 answer `404` rather than revealing that a record exists, and a department-scoped
 user with no department sees an empty result set. Writes are authorised from
 `request.user` and the persisted relationships, so a client cannot move a
-course, offering or component into another department — or attach a foreign
-student group — by sending different foreign-key ids.
+course, offering, component or instructor into another department — or attach a
+foreign student group or ineligible instructor — by sending different
+foreign-key ids. Such payloads answer `400`; existing records that are out of
+scope answer `403` or `404`.
 
 No endpoint exposes `DELETE`: detail routes answer `405` and lifecycle is managed
 with `is_active` (`TeachingComponentGroup` is a relation rather than a lifecycle
 record; it is currently maintained through the Django admin).
 
-Permission classes live in `academics/permissions.py`:
-`IsCollegeAdminOrReadOnly`, `CanManageDepartments`, `IsDepartmentScopedWriter`
-and, for the Phase 3 teaching resources, `IsDepartmentScopedManager` together
-with the `visible_*_filter` helpers.
+Permission classes live in `academics/permissions.py`
+(`IsCollegeAdminOrReadOnly`, `CanManageDepartments`, `IsDepartmentScopedWriter`
+and, for teaching and instructor resources, `IsDepartmentScopedManager` with the
+`visible_*_filter` helpers). Instructor read visibility lives in
+`resources/permissions.py`.
 
 ## Timezone
 
@@ -391,13 +486,16 @@ not used.
 ## Roadmap
 
 - **Phase 1 (done)** — roles, reusable role/department permissions, JWT login
-  and refresh, `/api/me/`, minimal `Department`.
-- **Phase 2 (done)** — `College`, expanded `Department`, `AcademicYear`,
-  `Semester`, `StudyProgram`, `StudyStage`, `StudentGroup` with optional
-  subgroups, plus the scoped REST API, permissions and admin.
-- **Phase 3 (done)** — `Course`, `CourseOffering`, `TeachingComponent` and
-  `TeachingComponentGroup`: theory/practical weekly hours, derived session
-  counts, combined groups, practical subgroups and joint inter-department
+  and refreshdone)** — instructors: `InstructorProfile`, sharing scopes and
+  `InstructorDepartmentAccess`, weekly availability, soft preferences, workload
+  limits, `TeachingAssignment` (`PRIMARY`/`ASSISTANT`) and
+  `/api/me/teaching-assignments/`.
+- **Phase 5 (planned)** — rooms and laboratories, room capabilities and room
+  assignment.
+- **Later** — calendar/time slots and timetable generation (OR-Tools),
+  reports/export, PostgreSQL, background jobs, Railway deployment.
+- **Flutter instructor app** — after the web application, using
+  `/api/me/teaching-assignments/` as one of its first endpointsactical subgroups and joint inter-department
   courses.
 - **Phase 4 (planned)** — instructors: `InstructorProfile`,
   `InstructorDepartmentAccess`, availability and preferences, and instructor

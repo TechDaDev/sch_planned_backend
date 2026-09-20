@@ -124,6 +124,22 @@ class SemesterNumber(models.IntegerChoices):
     SECOND = 2, "Second"
 
 
+class Weekday(models.IntegerChoices):
+    """Teaching weekdays of the college week (Sunday to Thursday).
+
+    The numbering is the college week order, not Python's ``date.weekday()``
+    (which starts on Monday). Instructor availability (Phase 4) and the later
+    calendar/time-slot phase share this definition so a second, incompatible
+    weekday representation is never introduced.
+    """
+
+    SUNDAY = 0, "Sunday"
+    MONDAY = 1, "Monday"
+    TUESDAY = 2, "Tuesday"
+    WEDNESDAY = 3, "Wednesday"
+    THURSDAY = 4, "Thursday"
+
+
 class Semester(models.Model):
     """A semester of an academic year. Dates are optional until published."""
 

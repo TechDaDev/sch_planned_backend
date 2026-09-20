@@ -216,5 +216,12 @@ SPECTACULAR_SETTINGS = {
                 "and the student groups attending them."
             ),
         },
+        {
+            "name": "instructors",
+            "description": (
+                "Instructor resources: profiles and sharing, weekly availability, "
+                "preferences and teaching assignments."
+            ),
+        },
     ],
 }
