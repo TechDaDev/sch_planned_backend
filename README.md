@@ -4,8 +4,9 @@ Django REST Framework backend for the College Academic Schedule Planner.
 Provides the project foundation (configuration package, domain app skeletons,
 custom user model, API/OpenAPI plumbing) that later phases build on.
 
-- Current phase: **Phase 4 — instructor resources and teaching assignments**
-  (no rooms, time slots or timetable generation yet).
+- Current phase: **Phase 5 — rooms, laboratories, capabilities and room
+  requirements** (no time slots, timetable generation or actual room assignment
+  yet).
 
 ## Architecture
 
@@ -35,31 +36,34 @@ sch_planner_backend/
 │   ├── urls.py        # /api/colleges/, /api/departments/, /api/courses/, ...
 │   └── migrations/    # 0001_initial, 0002_academic_structure,
 │                      # 0003_teaching_structure
-├── resources/         # instructors and their teaching assignments
+├── resources/         # instructors, rooms and their teaching requirements
 │   ├── models.py      # InstructorProfile, InstructorDepartmentAccess,
 │   │                  # InstructorAvailability, InstructorPreference,
-│   │                  # TeachingAssignment
-│   ├── permissions.py # instructor read-visibility rules
+│   │                  # TeachingAssignment, RoomType, RoomCapability, Room,
+│   │                  # RoomDepartmentAccess, RoomCapabilityAssignment,
+│   │                  # RoomAvailability, TeachingComponentRoomRequirement,
+│   │                  # TeachingComponentCapabilityRequirement
+│   ├── permissions.py # instructor and room read-visibility rules
 │   ├── serializers.py # read/write serializers + summaries
 │   ├── views.py       # viewsets + /api/me/teaching-assignments/
-│   ├── urls.py        # /api/instructors/, /api/teaching-assignments/, ...
-│   └── migrations/    # 0001_initial
+│   ├── urls.py        # /api/instructors/, /api/rooms/, ...
+│   └── migrations/    # 0001_initial, 0002_rooms_and_requirements
 ├── scheduling/        # time slots and solving (empty until later phases)
 ├── reports/           # report exports (empty until later phases)
 ├── tests/             # pytest suite for the whole project
-├── ma4 adds instructors as schedulable resources with department sharing,
-weekly availability, soft preferences and teaching assignments. Rooms and
-laboratories belong to **Phase 5**; calendar/time slots, timetable generation
-(OR-Tools) and reports come later. The Flutter instructor app follows the web
-application
+├── manage.py
+├── requirements.txt
+├── pytest.ini
+├── .env.example
+├── .gitignore
 └── README.md
 ```
 
-Phase 3 adds the teaching structure (courses, offerings, teaching components
-and the groups attending them). Instructors, instructor availability, rooms,
-laboratories and scheduling are still unimplemented:
-instructor assignment arrives in **Phase 4**, room/lab assignment in
-**Phase 5**, timetable generation later.
+Phase 5 adds physical teaching spaces (rooms and laboratories) with sharing,
+capabilities, weekly availability and the room requirements that teaching
+components declare. Calendar/time slots, timetable generation (OR-Tools),
+actual room assignment and reports come later. The Flutter instructor app
+follows the web application.
 
 ## Requirements
 
@@ -142,14 +146,24 @@ All resource APIs expose the same five operations — `GET` list, `GET` detail,
 | Instructor availability   | `/api/instructor-availability/`    | availability's instructor primary department |
 | Instructor preferences    | `/api/instructor-preferences/`     | preference's instructor primary department |
 | Teaching assignments      | `/api/teaching-assignments/`       | component's offering managing department |
+| Room types                | `/api/room-types/`                 | college-wide (writes: college admin)   |
+| Room capabilities         | `/api/room-capabilities/`          | college-wide (writes: college admin)   |
+| Rooms                     | `/api/rooms/`                      | `room.owner_department` (+ sharing)    |
+| Room access grants        | `/api/room-department-access/`     | grant's room owner department          |
+| Room capability assignments | `/api/room-capability-assignments/` | assignment's room owner department   |
+| Room availability         | `/api/room-availability/`          | availability's room owner department   |
+| Room requirements         | `/api/teaching-component-room-requirements/` | component's offering managing department |
+| Capability requirements   | `/api/teaching-component-capability-requirements/` | component's offering managing department |
 
-Write ownership in this table is stricter than read visibility for instructors:
-shared instructors are readable by the departments they are shared with, and
-joint-course instructors are readable by participating departments, but writes
-always stay with the owning (primary) department. Simple exact-match query
-filters are available on the instructor resources (`primary_department`,
-`sharing_scope`, `instructor`, `semester`, `day_of_week`, `preference_type`,
-`assignment_role`, `is_active`); invalid filter values answer `400`.
+Write ownership in this table is stricter than read visibility for shared
+resources: shared instructors and rooms are readable by the departments they are
+shared with, and joint-course components are readable by participating
+departments, but writes always stay with the owning department. Simple
+exact-match query filters are available on the resource endpoints
+(`primary_department`, `owner_department`, `room_type`, `sharing_scope`,
+`instructor`, `room`, `semester`, `day_of_week`, `preference_type`,
+`capability`, `assignment_role`, `is_active`); invalid filter values answer
+`400`.
 
 `DELETE` is intentionally not part of the API: the detail routes exist but
 answer **405 Method Not Allowed**. Lifecycle is managed with `is_active`.
@@ -425,18 +439,84 @@ instructor teaches one joint course. A participating department sees who teaches
 the joint course (read-only) but cannot assign that instructor elsewhere, and
 cannot inspect their full weekly availability.
 
+## Room resources
+
+Physical teaching spaces are modelled as owned resources with sharing, plus the
+room requirements that teaching components state for later scheduling.
+
+| Model | Key fields | Notable rules |
+| --- | --- | --- |
+| `RoomType` | `name`, unique `code`, `description`, `is_active`, timestamps | college-wide vocabulary (`LECTURE_HALL`, `COMPUTER_LAB`, ...); writable by college admins only |
+| `RoomCapability` | `name`, unique `code`, `description`, `is_active`, timestamps | college-wide equipment vocabulary (`COMPUTERS`, `PROJECTOR`, ...); writable by college admins only |
+| `Room` | `owner_department`, `name`, unique `code`, `room_type`, `capacity` (>= 1), `sharing_scope`, `is_active`, timestamps | globally unique physical room code; ownership is `PROTECT`ed; `capacity` must be at least 1 |
+| `RoomDepartmentAccess` | `room`, `department`, `is_active`, timestamps | one row per room/department; the owner department cannot be granted (it already has access) |
+| `RoomCapabilityAssignment` | `room`, `capability`, `created_at` | one row per room/capability; capabilities are rows, never comma-separated text |
+| `RoomAvailability` | `room`, `semester`, `day_of_week`, `start_time`, `end_time`, `is_active`, timestamps | recurring weekly windows; `start_time < end_time`; active windows may not overlap (adjacent boundaries are fine, exact duplicates blocked by a partial unique index) |
+| `TeachingComponentRoomRequirement` | `teaching_component` (one-to-one), `required_room_type` (nullable), `minimum_capacity` (nullable), `is_active`, timestamps | one requirement per component; `null` room type means no type restriction; derived values are read-only |
+| `TeachingComponentCapabilityRequirement` | `room_requirement`, `capability`, `created_at` | one row per requirement/capability; every required capability must be present in a room |
+
+### Room sharing scopes
+
+| Scope | Meaning |
+| --- | --- |
+| `PRIVATE` (default) | usable only by the owner department |
+| `SELECTED_DEPARTMENTS` | also usable by departments holding an **active** `RoomDepartmentAccess` row |
+| `COLLEGE_WIDE` | usable by any active department |
+
+`Room.can_be_used_by_department(department)` is the canonical sharing rule: an
+inactive room or inactive room type is never usable, the owner department always
+may use it, `SELECTED_DEPARTMENTS` requires an active grant, `COLLEGE_WIDE`
+allows any active department. Changing a scope never deletes stored grants; a
+non-selected scope simply ignores them.
+
+### Capacity rules
+
+```
+expected_student_count      = sum of student_count of the groups attached to the component
+effective_minimum_capacity = max(expected_student_count, minimum_capacity if supplied)
+```
+
+With groups of 25 and 30 students the expected count is 55; supplying
+`minimum_capacity = 60` raises the effective minimum to 60, and leaving it
+`null` keeps 55. Both values are derived at read time and never stored.
+
+### Room suitability helper
+
+`Room.evaluate_suitability(requirement)` returns the reasons a room does **not**
+satisfy a requirement (room/room-type activity, access for the offering's
+managing department, required room type, effective minimum capacity, and every
+required capability — an "all capabilities" rule, never "any").
+`Room.meets_requirement(requirement)` is the boolean form, and
+`Room.is_suitable_for_teaching_component(component)` is deliberately
+conservative: a component **without an active room requirement** is never
+reported as suitable, because nothing states what it needs. Time slots are not
+part of the helper yet.
+
+### Shared rooms do not transfer ownership
+
+A department that may use another department's room can see the room, its
+capabilities and its availability, and can later schedule into it — but it can
+never rename it, change its capacity, type, sharing scope, capabilities or
+availability, nor grant it to a third department. Only the owner department (or
+a college administrator) controls the resource.
+
+**Actual room assignment is not implemented yet.** Teaching components define
+requirements only; the room a session finally uses belongs to future
+timetable/schedule entries, and room double-booking detection arrives with that
+scheduling layer.
+
 ## Who may write what
 
 | Role | Reads | Writes |
 | --- | --- | --- |
-| `COLLEGE_ADMIN` or Django superuser | everything | everything: colleges, academic years, semesters, joint-course group associations, instructor profiles, sharing grants, availability, preferences and assignments |
-| `DEPARTMENT_ADMIN` | own department plus joint components their students attend and instructors shared with them | own department: update it; manage programs, stages, groups, courses, offerings, components, component/group links (own groups only), instructor profiles, sharing grants, availability and preferences; assignments on components their department manages, choosing own or eligible shared instructors |
-| `SCHEDULER`, `VIEWER`, `INSTRUCTOR` | own department plus joint components their students attend, and instructors shared with them | none — academic, teaching and instructor structure is read-only for these roles |
+| `COLLEGE_ADMIN` or Django superuser | everything | everything: colleges, academic years, semesters, joint-course group associations, instructor profiles, sharing grants, availability, preferences, assignments, room types, room capabilities, rooms, room grants, room capabilities and availability, and teaching-component room requirements |
+| `DEPARTMENT_ADMIN` | own department plus joint components their students attend, instructors shared with them, and rooms they may use | own department: update it; manage programs, stages, groups, courses, offerings, components, component/group links (own groups only), instructor profiles, sharing grants, availability, preferences, assignments on components their department manages, own rooms with their grants, capabilities and availability, and room requirements for components their department manages |
+| `SCHEDULER`, `VIEWER`, `INSTRUCTOR` | own department plus joint components their students attend, instructors shared with them, and rooms they may use | none — every Phase 2–5 resource is read-only for these roles |
 
-A department can never modify a shared instructor profile, inspect availability
-that is not shared with it, grant itself access to a foreign instructor, or
-assign an ineligible instructor — sharing changes are always made by the owning
-department (or a college administrator).
+A department can never modify a shared instructor or room, inspect availability
+that is not shared with it, grant itself access to a foreign instructor or room,
+or assign an ineligible instructor or an unsuitable room requirement — sharing
+changes are always made by the owning department (or a college administrator).
 
 Every endpoint requires authentication. Department-scoped reads return only what
 the caller's department owns **or participates in**: out-of-scope detail requests

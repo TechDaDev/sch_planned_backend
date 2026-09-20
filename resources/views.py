@@ -17,27 +17,42 @@ Read visibility comes from ``resources.permissions``:
 from django.core.exceptions import FieldDoesNotExist, ImproperlyConfigured
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import models
+from django.db.models import Prefetch
 from drf_spectacular.utils import extend_schema
 from rest_framework import generics
 from rest_framework.exceptions import ValidationError as DRFValidationError
 from rest_framework.permissions import IsAuthenticated
 
-from academics.models import Department, Semester, TeachingComponent
-from academics.permissions import IsDepartmentScopedManager
+from academics.models import Department, Semester, TeachingComponent, TeachingComponentGroup
+from academics.permissions import IsCollegeAdminOrReadOnly, IsDepartmentScopedManager
 from academics.views import AcademicStructureViewSet, DepartmentVisibilityQuerysetMixin
 from resources.models import (
     InstructorAvailability,
     InstructorDepartmentAccess,
     InstructorPreference,
     InstructorProfile,
+    Room,
+    RoomAvailability,
+    RoomCapability,
+    RoomCapabilityAssignment,
+    RoomDepartmentAccess,
+    RoomType,
     TeachingAssignment,
+    TeachingComponentCapabilityRequirement,
+    TeachingComponentRoomRequirement,
 )
 from resources.permissions import (
     visible_assignments_filter,
     visible_availability_filter,
+    visible_capability_requirements_filter,
     visible_instructor_access_filter,
     visible_instructors_filter,
     visible_preferences_filter,
+    visible_room_access_filter,
+    visible_room_availability_filter,
+    visible_room_capability_assignments_filter,
+    visible_room_requirements_filter,
+    visible_rooms_filter,
 )
 from resources.serializers import (
     InstructorAvailabilitySerializer,
@@ -48,11 +63,26 @@ from resources.serializers import (
     InstructorPreferenceWriteSerializer,
     InstructorProfileSerializer,
     InstructorProfileWriteSerializer,
+    RoomAvailabilitySerializer,
+    RoomAvailabilityWriteSerializer,
+    RoomCapabilityAssignmentSerializer,
+    RoomCapabilityAssignmentWriteSerializer,
+    RoomCapabilitySerializer,
+    RoomDepartmentAccessSerializer,
+    RoomDepartmentAccessWriteSerializer,
+    RoomSerializer,
+    RoomTypeSerializer,
+    RoomWriteSerializer,
     TeachingAssignmentSerializer,
     TeachingAssignmentWriteSerializer,
+    TeachingComponentCapabilityRequirementSerializer,
+    TeachingComponentCapabilityRequirementWriteSerializer,
+    TeachingComponentRoomRequirementSerializer,
+    TeachingComponentRoomRequirementWriteSerializer,
 )
 
 INSTRUCTOR_TAGS = ["instructors"]
+ROOM_TAGS = ["rooms"]
 
 _BOOLEAN_TRUE = {"1", "true", "yes", "on"}
 _BOOLEAN_FALSE = {"0", "false", "no", "off"}
@@ -266,4 +296,182 @@ class MyTeachingAssignmentsView(generics.ListAPIView):
             )
             .order_by("teaching_component__offering__course__code", "teaching_component_id")
         )
+
+
+# --- Phase 5: rooms, laboratories, capabilities and requirements -------------
+
+
+@extend_schema(tags=ROOM_TAGS)
+class RoomTypeViewSet(AcademicStructureViewSet):
+    """College-wide room type vocabulary; writable by college admins only."""
+
+    queryset = RoomType.objects.all()
+    read_serializer_class = RoomTypeSerializer
+    permission_classes = [IsAuthenticated, IsCollegeAdminOrReadOnly]
+    filter_fields = ("is_active",)
+
+
+@extend_schema(tags=ROOM_TAGS)
+class RoomCapabilityViewSet(AcademicStructureViewSet):
+    """College-wide room capability vocabulary; writable by college admins only."""
+
+    queryset = RoomCapability.objects.all()
+    read_serializer_class = RoomCapabilitySerializer
+    permission_classes = [IsAuthenticated, IsCollegeAdminOrReadOnly]
+    filter_fields = ("is_active",)
+
+
+@extend_schema(tags=ROOM_TAGS)
+class RoomViewSet(
+    QueryParameterFilterMixin,
+    DepartmentVisibilityQuerysetMixin,
+    AcademicStructureViewSet,
+):
+    """Rooms owned by a department, readable by departments they are shared with."""
+
+    queryset = Room.objects.select_related("owner_department", "room_type")
+    read_serializer_class = RoomSerializer
+    write_serializer_class = RoomWriteSerializer
+    permission_classes = [IsAuthenticated, IsDepartmentScopedManager]
+    management_department_lookups = ("owner_department",)
+    filter_fields = ("owner_department", "room_type", "sharing_scope", "is_active")
+
+    def visibility_filter(self, user):
+        return visible_rooms_filter(user)
+
+
+@extend_schema(tags=ROOM_TAGS)
+class RoomDepartmentAccessViewSet(
+    QueryParameterFilterMixin,
+    DepartmentVisibilityQuerysetMixin,
+    AcademicStructureViewSet,
+):
+    """Room sharing grants; only the owning department may grant or revoke them."""
+
+    queryset = RoomDepartmentAccess.objects.select_related(
+        "room", "room__owner_department", "department"
+    )
+    read_serializer_class = RoomDepartmentAccessSerializer
+    write_serializer_class = RoomDepartmentAccessWriteSerializer
+    permission_classes = [IsAuthenticated, IsDepartmentScopedManager]
+    management_department_lookups = ("room__owner_department",)
+    filter_fields = ("room", "department", "is_active")
+
+    def visibility_filter(self, user):
+        return visible_room_access_filter(user)
+
+
+@extend_schema(tags=ROOM_TAGS)
+class RoomCapabilityAssignmentViewSet(
+    QueryParameterFilterMixin,
+    DepartmentVisibilityQuerysetMixin,
+    AcademicStructureViewSet,
+):
+    """Capabilities present in a room; readable wherever the room is visible."""
+
+    queryset = RoomCapabilityAssignment.objects.select_related(
+        "room", "room__owner_department", "capability"
+    )
+    read_serializer_class = RoomCapabilityAssignmentSerializer
+    write_serializer_class = RoomCapabilityAssignmentWriteSerializer
+    permission_classes = [IsAuthenticated, IsDepartmentScopedManager]
+    management_department_lookups = ("room__owner_department",)
+    filter_fields = ("room", "capability")
+
+    def visibility_filter(self, user):
+        return visible_room_capability_assignments_filter(user)
+
+
+@extend_schema(tags=ROOM_TAGS)
+class RoomAvailabilityViewSet(
+    QueryParameterFilterMixin,
+    DepartmentVisibilityQuerysetMixin,
+    AcademicStructureViewSet,
+):
+    """Recurring weekly room availability windows."""
+
+    queryset = RoomAvailability.objects.select_related(
+        "room",
+        "room__owner_department",
+        "semester",
+        "semester__academic_year",
+    )
+    read_serializer_class = RoomAvailabilitySerializer
+    write_serializer_class = RoomAvailabilityWriteSerializer
+    permission_classes = [IsAuthenticated, IsDepartmentScopedManager]
+    management_department_lookups = ("room__owner_department",)
+    filter_fields = ("room", "semester", "day_of_week", "is_active")
+
+    def visibility_filter(self, user):
+        return visible_room_availability_filter(user)
+
+
+@extend_schema(tags=ROOM_TAGS)
+class TeachingComponentRoomRequirementViewSet(
+    QueryParameterFilterMixin,
+    DepartmentVisibilityQuerysetMixin,
+    AcademicStructureViewSet,
+):
+    """General room requirements defined per teaching component.
+
+    Components define requirements only; the actual room is chosen later by the
+    scheduling layer, so no room reference exists here.
+    """
+
+    queryset = (
+        TeachingComponentRoomRequirement.objects.select_related(
+            "teaching_component",
+            "teaching_component__offering",
+            "teaching_component__offering__course",
+            "teaching_component__offering__managing_department",
+            "required_room_type",
+        ).prefetch_related(
+            Prefetch(
+                "teaching_component__group_links",
+                queryset=TeachingComponentGroup.objects.select_related("student_group"),
+                to_attr="attached_group_links",
+            ),
+            Prefetch(
+                "capability_requirements",
+                queryset=TeachingComponentCapabilityRequirement.objects.select_related(
+                    "capability"
+                ),
+            ),
+        )
+    )
+    read_serializer_class = TeachingComponentRoomRequirementSerializer
+    write_serializer_class = TeachingComponentRoomRequirementWriteSerializer
+    permission_classes = [IsAuthenticated, IsDepartmentScopedManager]
+    management_department_lookups = ("teaching_component__offering__managing_department",)
+    filter_fields = ("teaching_component", "required_room_type", "is_active")
+
+    def visibility_filter(self, user):
+        return visible_room_requirements_filter(user)
+
+
+@extend_schema(tags=ROOM_TAGS)
+class TeachingComponentCapabilityRequirementViewSet(
+    QueryParameterFilterMixin,
+    DepartmentVisibilityQuerysetMixin,
+    AcademicStructureViewSet,
+):
+    """Capabilities a room must provide for a component's room requirement."""
+
+    queryset = TeachingComponentCapabilityRequirement.objects.select_related(
+        "capability",
+        "room_requirement",
+        "room_requirement__teaching_component",
+        "room_requirement__teaching_component__offering",
+        "room_requirement__teaching_component__offering__managing_department",
+    )
+    read_serializer_class = TeachingComponentCapabilityRequirementSerializer
+    write_serializer_class = TeachingComponentCapabilityRequirementWriteSerializer
+    permission_classes = [IsAuthenticated, IsDepartmentScopedManager]
+    management_department_lookups = (
+        "room_requirement__teaching_component__offering__managing_department",
+    )
+    filter_fields = ("room_requirement", "capability")
+
+    def visibility_filter(self, user):
+        return visible_capability_requirements_filter(user)
 

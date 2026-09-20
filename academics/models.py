@@ -556,6 +556,23 @@ class TeachingComponent(models.Model):
         label = self.label or self.get_component_type_display()
         return f"{self.offering} — {label}"
 
+    @property
+    def expected_student_count(self) -> int:
+        """Students this component is expected to teach.
+
+        Sums the ``student_count`` of the groups directly attached through
+        ``TeachingComponentGroup``. Phase 3 rejects ancestor/descendant overlap
+        inside one component, so the sum does not double count. Uses the
+        ``attached_group_links`` prefetch when a queryset supplied one.
+        """
+        links = getattr(self, "attached_group_links", None)
+        if links is not None:
+            return sum(link.student_group.student_count for link in links)
+        total = self.group_links.aggregate(
+            total=models.Sum("student_group__student_count")
+        )["total"]
+        return total or 0
+
 
 class TeachingComponentGroup(models.Model):
     """Attaches a student group (or subgroup) to a teaching component.

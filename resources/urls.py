@@ -9,7 +9,15 @@ from resources.views import (
     InstructorPreferenceViewSet,
     InstructorProfileViewSet,
     MyTeachingAssignmentsView,
+    RoomAvailabilityViewSet,
+    RoomCapabilityAssignmentViewSet,
+    RoomCapabilityViewSet,
+    RoomDepartmentAccessViewSet,
+    RoomTypeViewSet,
+    RoomViewSet,
     TeachingAssignmentViewSet,
+    TeachingComponentCapabilityRequirementViewSet,
+    TeachingComponentRoomRequirementViewSet,
 )
 
 app_name = "resources"
@@ -35,6 +43,34 @@ router.register(
     "teaching-assignments",
     TeachingAssignmentViewSet,
     basename="teaching-assignment",
+)
+router.register("room-types", RoomTypeViewSet, basename="room-type")
+router.register("room-capabilities", RoomCapabilityViewSet, basename="room-capability")
+router.register("rooms", RoomViewSet, basename="room")
+router.register(
+    "room-department-access",
+    RoomDepartmentAccessViewSet,
+    basename="room-department-access",
+)
+router.register(
+    "room-capability-assignments",
+    RoomCapabilityAssignmentViewSet,
+    basename="room-capability-assignment",
+)
+router.register(
+    "room-availability",
+    RoomAvailabilityViewSet,
+    basename="room-availability",
+)
+router.register(
+    "teaching-component-room-requirements",
+    TeachingComponentRoomRequirementViewSet,
+    basename="teaching-component-room-requirement",
+)
+router.register(
+    "teaching-component-capability-requirements",
+    TeachingComponentCapabilityRequirementViewSet,
+    basename="teaching-component-capability-requirement",
 )
 
 urlpatterns = router.urls + [

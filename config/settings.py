@@ -223,5 +223,12 @@ SPECTACULAR_SETTINGS = {
                 "preferences and teaching assignments."
             ),
         },
+        {
+            "name": "rooms",
+            "description": (
+                "Room resources: room types and capabilities, rooms and sharing, "
+                "availability and teaching-component room requirements."
+            ),
+        },
     ],
 }
