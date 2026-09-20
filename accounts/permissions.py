@@ -21,8 +21,12 @@ from accounts.models import User, UserRole
 from academics.models import Department
 
 
-def _is_authenticated_active_user(request) -> bool:
-    """Return True when the request carries an authenticated, active user."""
+def is_authenticated_active_user(request) -> bool:
+    """Return True when the request carries an authenticated, active user.
+
+    Public because the Phase 2 academic permissions reuse this exact rule
+    instead of defining a second active-user check.
+    """
     user = getattr(request, "user", None)
     return bool(user and user.is_authenticated and user.is_active)
 
@@ -35,7 +39,7 @@ class HasRole(BasePermission):
     allow_superuser: bool = False
 
     def has_permission(self, request, view) -> bool:
-        if not _is_authenticated_active_user(request):
+        if not is_authenticated_active_user(request):
             return False
         if self.allow_superuser and request.user.is_superuser:
             return True
@@ -78,7 +82,7 @@ class IsCollegeOrDepartmentAdmin(BasePermission):
     """Allows any administrative application role, or a Django superuser."""
 
     def has_permission(self, request, view) -> bool:
-        if not _is_authenticated_active_user(request):
+        if not is_authenticated_active_user(request):
             return False
         return request.user.is_superuser or request.user.has_admin_role
 
@@ -98,7 +102,7 @@ class IsSameDepartmentOrCollegeAdmin(BasePermission):
     """
 
     def has_permission(self, request, view) -> bool:
-        return _is_authenticated_active_user(request)
+        return is_authenticated_active_user(request)
 
     def has_object_permission(self, request, view, obj) -> bool:
         user = request.user
@@ -132,4 +136,5 @@ __all__ = [
     "IsSameDepartmentOrCollegeAdmin",
     "IsScheduler",
     "IsViewer",
+    "is_authenticated_active_user",
 ]

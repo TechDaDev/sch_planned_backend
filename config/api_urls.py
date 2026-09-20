@@ -13,6 +13,7 @@ urlpatterns = [
     path("health/", HealthView.as_view(), name="api-health"),
     # Application URLconfs.
     path("", include("accounts.urls")),
+    path("", include("academics.urls")),
     # OpenAPI schema and Swagger UI.
     path("schema/", SpectacularAPIView.as_view(), name="api-schema"),
     path(

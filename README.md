@@ -4,8 +4,8 @@ Django REST Framework backend for the College Academic Schedule Planner.
 Provides the project foundation (configuration package, domain app skeletons,
 custom user model, API/OpenAPI plumbing) that later phases build on.
 
-- Current phase: **Phase 1 — authentication, roles and permission foundation**
-  (no academic scheduling yet).
+- Current phase: **Phase 2 — academic structure** (no courses, rooms or
+  scheduling yet).
 
 ## Architecture
 
@@ -21,10 +21,17 @@ sch_planner_backend/
 ├── accounts/          # custom user model, roles, permissions, auth API
 │   ├── models.py      # User (AbstractUser) + UserRole
 │   ├── permissions.py # reusable role and department-scope permissions
-│   ├── serializers.py # current-user / department representations
+│   ├── serializers.py # current-user representation
 │   ├── views.py       # login, refresh, /api/me/
 │   └── urls.py        # /api/auth/*, /api/me/
-├── academics/         # Department model (courses, stages, programs later)
+├── academics/         # academic structure
+│   ├── models.py      # College, Department, AcademicYear, Semester,
+│   │                  # StudyProgram, StudyStage, StudentGroup
+│   ├── permissions.py # Phase 2 role/department permissions
+│   ├── serializers.py # read/write serializers + nested summaries
+│   ├── views.py       # DRF viewsets (no hard delete)
+│   ├── urls.py        # /api/colleges/, /api/departments/, ...
+│   └── migrations/    # 0001_initial (Phase 1), 0002_academic_structure
 ├── resources/         # rooms, time resources (empty until later phases)
 ├── scheduling/        # schedules and solving (empty until later phases)
 ├── reports/           # report exports (empty until later phases)
@@ -37,9 +44,9 @@ sch_planner_backend/
 └── README.md
 ```
 
-Phase 1 adds the user/role and minimal department foundation. Academic
-structure beyond `Department` (programs, stages, courses, instructors, rooms)
-is intentionally empty until later phases.
+Phase 2 adds the academic hierarchy and the college-wide calendar. Courses,
+course offerings, teaching components, instructors as academic resources,
+rooms/labs and scheduling are still unimplemented.
 
 ## Requirements
 
@@ -99,6 +106,25 @@ Run the development server:
 | GET    | `/api/me/`           | authenticated | Current user identity, role, dept. |
 | GET    | `/api/schema/`       | public        | OpenAPI 3 schema                   |
 | GET    | `/api/docs/`         | public        | Swagger UI for the schema          |
+
+All Phase 2 resources expose the same five operations — `GET` list, `GET`
+detail, `POST`, `PUT`, `PATCH`:
+
+| Resource          | Path                    | Department scope path                 |
+| ----------------- | ----------------------- | ------------------------------------- |
+| Colleges          | `/api/colleges/`        | college-wide                          |
+| Departments       | `/api/departments/`     | the department itself                 |
+| Academic years    | `/api/academic-years/`  | college-wide                          |
+| Semesters         | `/api/semesters/`       | college-wide                          |
+| Study programs    | `/api/programs/`        | `program.department`                  |
+| Study stages      | `/api/stages/`          | `stage.program.department`            |
+| Student groups    | `/api/student-groups/`  | `group.stage.program.department`      |
+
+`DELETE` is intentionally not part of the API: the detail routes exist but
+answer **405 Method Not Allowed**. Lifecycle is managed with `is_active`.
+
+Requests with payloads must send `Content-Type: application/json`; the API is
+configured with DRF's `JSONParser` only, so other content types answer `415`.
 
 Health response:
 
@@ -206,13 +232,71 @@ Decisions, applied consistently:
   and never trusts a department id coming from the request body.
 - Views must reuse these classes instead of comparing role strings inline.
 
-## Departments
+## Academic structure
 
-`academics.Department` is minimal for now: `name`, unique `code` (for example
-`BIOAI`, `CS`), `is_active`, `created_at`, `updated_at`. `accounts.User`
-references it through an optional (`SET_NULL`) `department` foreign key, so
-users can exist without a department. Real academic structure — programs,
-stages, courses, instructors, rooms — arrives in Phase 2.
+`academics` implements the hierarchy and the college calendar:
+
+```
+College
+└── Department
+    └── StudyProgram            study_type: UNDERGRADUATE | MASTER | PHD
+        └── StudyStage          number (>= 1) + free-form name
+            └── StudentGroup    code + student_count
+                └── StudentGroup  optional subgroup hierarchy (parent_group)
+
+AcademicYear  2026-2027
+└── Semester   number 1 or 2, optional start/end dates
+```
+
+| Model | Key fields | Notable rules |
+| --- | --- | --- |
+| `College` | `name`, unique `code`, `is_active`, timestamps | one college per deployment today; no multi-college tenancy |
+| `Department` | `college` (optional), `name`, unique `code`, `is_active`, timestamps | `college` is nullable so Phase 1 rows stay valid; the API requires it on create |
+| `AcademicYear` | `start_year`, `end_year`, `is_active`, timestamps | `end_year = start_year + 1`; `(start_year, end_year)` unique |
+| `Semester` | `academic_year`, `number`, `start_date`, `end_date`, `is_active`, timestamps | `(academic_year, number)` unique; `end_date >= start_date` when both are set |
+| `StudyProgram` | `department`, `name`, `code`, `study_type`, `is_active`, timestamps | `(department, code)` unique — the same code may exist in another department |
+| `StudyStage` | `program`, `number`, `name`, `is_active`, timestamps | `(program, number)` unique; stage count is not hard-coded |
+| `StudentGroup` | `stage`, `name`, `code`, `student_count`, `parent_group`, `is_active`, timestamps | `(stage, code)` unique; a subgroup must share its parent's stage, cannot parent itself and cannot form a cycle |
+
+Rules SQL can express live in the database (unique constraints plus check
+constraints for consecutive years, semester date order, positive stage number,
+non-negative student counts and self-parenting). Cross-row rules — subgroup
+stage and cycle checks — live in `Model.clean()`, and the API serializers run
+the same `clean()`, so predictable invalid input answers `400` instead of
+failing at the database level.
+
+`accounts.User.department` stays optional (`SET_NULL`), so users can exist
+without a department.
+
+## Study types
+
+`study_type` is a stable enum (`academics.StudyType`): `UNDERGRADUATE`,
+`MASTER`, `PHD`. Arbitrary free-text study types are not accepted.
+
+## Who may write what
+
+| Role | Reads | Writes |
+| --- | --- | --- |
+| `COLLEGE_ADMIN` or Django superuser | everything | everything, including colleges, academic years and semesters |
+| `DEPARTMENT_ADMIN` | own department hierarchy | own department: update it, and manage programs, stages and groups inside it |
+| `SCHEDULER`, `VIEWER`, `INSTRUCTOR` | own department hierarchy | none — academic structure is read-only for these roles |
+
+Every endpoint requires authentication. Department-scoped reads return only the
+caller's department: out-of-scope detail requests answer `404` rather than
+revealing that a record exists, and a department-scoped user with no department
+sees an empty result set. Writes are authorised from `request.user` and the
+persisted relationships, so a client cannot move a program, stage or group into
+another department by sending a different foreign-key id.
+
+Permission classes live in `academics/permissions.py`:
+`IsCollegeAdminOrReadOnly`, `CanManageDepartments` and
+`IsDepartmentScopedWriter`.
+
+## Timezone
+
+Django runs timezone-aware (`USE_TZ = True`) with `TIME_ZONE = "Asia/Baghdad"`.
+Timestamps are stored normally and rendered in Baghdad local time; application
+code never appends manual UTC offsets.
 
 ## Configuration
 
@@ -227,16 +311,20 @@ Settings are read from environment variables (optionally via `.env`):
 
 Other fixed settings: `AUTH_USER_MODEL = "accounts.User"`,
 `TIME_ZONE = "Asia/Baghdad"`, `USE_I18N = True`, `USE_TZ = True`, SQLite via
-`db.sqlite3`. DRF uses SimpleJWT as its authentication class and
-`IsAuthenticated` as the default permission; only the endpoints listed above opt
-out with `AllowAny`. CORS is restricted to the configured origins —
-`CORS_ALLOW_ALL_ORIGINS` is deliberately not used.
+`db.sqlite3`. DRF uses SimpleJWT as its authentication class,
+`IsAuthenticated` as the default permission and `JSONParser` as its only
+parser; only the endpoints listed above opt out with `AllowAny`. CORS is
+restricted to the configured origins — `CORS_ALLOW_ALL_ORIGINS` is deliberately
+not used.
 
 ## Roadmap
 
 - **Phase 1 (done)** — roles, reusable role/department permissions, JWT login
   and refresh, `/api/me/`, minimal `Department`.
-- **Phase 2** — academic structure (programs, stages, courses, instructors),
-  department/course/room APIs, user management.
-- **Phase 3** — schedule generation (OR-Tools) and schedule APIs.
-- **Phase 4** — reporting/export, PostgreSQL, background jobs, deployment.
+- **Phase 2 (done)** — `College`, expanded `Department`, `AcademicYear`,
+  `Semester`, `StudyProgram`, `StudyStage`, `StudentGroup` with optional
+  subgroups, plus the scoped REST API, permissions and admin.
+- **Next** — courses, course offerings, teaching components, instructors and
+  rooms/labs.
+- **Later** — schedule generation (OR-Tools), reports/export, PostgreSQL,
+  background jobs, deployment.

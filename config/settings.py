@@ -198,4 +198,16 @@ SPECTACULAR_SETTINGS = {
     "COMPONENT_SPLIT_REQUEST": True,
     "SERVE_PERMISSIONS": ["rest_framework.permissions.AllowAny"],
     "SERVE_AUTHENTICATION": [],
+    "TAGS": [
+        {"name": "system", "description": "Service health."},
+        {"name": "auth", "description": "JWT login and token refresh."},
+        {"name": "accounts", "description": "Current user identity."},
+        {
+            "name": "academics",
+            "description": (
+                "Academic structure: colleges, departments, academic years, semesters, "
+                "study programs, study stages and student groups."
+            ),
+        },
+    ],
 }

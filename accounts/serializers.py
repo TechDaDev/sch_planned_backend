@@ -7,18 +7,9 @@ from rest_framework_simplejwt.serializers import TokenRefreshSerializer
 from rest_framework_simplejwt.settings import api_settings
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from academics.models import Department
+from academics.serializers import DepartmentSummarySerializer
 
 User = get_user_model()
-
-
-class DepartmentSummarySerializer(serializers.ModelSerializer):
-    """Compact read-only department representation."""
-
-    class Meta:
-        model = Department
-        fields = ("id", "name", "code")
-        read_only_fields = fields
 
 
 class CurrentUserSerializer(serializers.ModelSerializer):
