@@ -11,6 +11,7 @@ from scheduling.views import (
     DepartmentScheduleDraftView,
     DepartmentScheduleGenerationView,
     PreSchedulingValidationView,
+    PublishedScheduleAnalyticsView,
     PublishedScheduleCurrentView,
     ScheduleVersionViewSet,
     ScheduleViewSet,
@@ -75,6 +76,12 @@ urlpatterns = [
         "published-schedules/current/",
         PublishedScheduleCurrentView.as_view(),
         name="published-schedule-current",
+    ),
+    # Phase 14: read-only analytics over the same authoritative publication.
+    path(
+        "published-schedules/current/analytics/",
+        PublishedScheduleAnalyticsView.as_view(),
+        name="published-schedule-analytics",
     ),
     *router.urls,
 ]

@@ -40,6 +40,11 @@ Phase 13 adds workflow and publication. Advancing a stage needs a management rol
 (``VIEWER`` and ``INSTRUCTOR`` cannot), which stage a role may advance depends on the
 schedule's scope, and the published timetable gets its own visibility rule because it
 is the first artefact meant to be read outside schedule management.
+
+Phase 14 adds analytics over persisted versions. Management analytics reuse the draft
+read scoping so they can never widen schedule access, and published analytics reuse the
+published timetable's role set: ``INSTRUCTOR`` keeps the timetable but gets no
+analytics dashboard.
 """
 
 from django.db import models
@@ -235,6 +240,39 @@ def can_run_schedule_workflow(user) -> bool:
     return bool(user.is_superuser or user.role in SCHEDULE_WORKFLOW_ROLES)
 
 
+#: Roles that may read published analytics.
+#: ``INSTRUCTOR`` is deliberately absent: the official timetable endpoint is their
+#: source, and Phase 14 offers no instructor analytics dashboard.
+PUBLISHED_ANALYTICS_ROLES = frozenset(
+    {
+        UserRole.COLLEGE_ADMIN,
+        UserRole.DEPARTMENT_ADMIN,
+        UserRole.SCHEDULER,
+        UserRole.VIEWER,
+    }
+)
+
+
+def can_read_published_analytics(user) -> bool:
+    """True when the user's role may read published analytics at all."""
+    return bool(user.is_superuser or user.role in PUBLISHED_ANALYTICS_ROLES)
+
+
+class CanReadPublishedAnalytics(BasePermission):
+    """Role gate for analytics of the officially published timetable.
+
+    Analytics summarize a whole timetable, so they are a management view: an
+    instructor keeps the published timetable endpoint but is refused here, and a
+    department-scoped account without a department is handled by the view, which fails
+    closed before any aggregation happens.
+    """
+
+    def has_permission(self, request, view) -> bool:
+        if not is_authenticated_active_user(request):
+            return False
+        return can_read_published_analytics(request.user)
+
+
 class CanRunScheduleWorkflow(BasePermission):
     """Role gate for the workflow actions and the workflow validation report.
 
@@ -314,16 +352,19 @@ def resolve_validation_scope(user, *, scope, department):
 
 
 __all__ = [
+    "PUBLISHED_ANALYTICS_ROLES",
     "SCHEDULE_EDIT_ROLES",
     "SCHEDULE_READ_ROLES",
     "SCHEDULE_WORKFLOW_ROLES",
     "CanEditScheduleDraft",
     "CanManageCalendarExceptions",
+    "CanReadPublishedAnalytics",
     "CanReadScheduleData",
     "CanRunCollegeScheduleGeneration",
     "CanRunPreSchedulingValidation",
     "CanRunScheduleWorkflow",
     "can_edit_schedule_data",
+    "can_read_published_analytics",
     "can_read_schedule_data",
     "can_run_schedule_workflow",
     "resolve_validation_scope",

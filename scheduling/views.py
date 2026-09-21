@@ -13,7 +13,10 @@ from django.db.models import Count, OuterRef, Subquery
 from drf_spectacular.utils import OpenApiParameter, OpenApiResponse, extend_schema
 from rest_framework import status
 from rest_framework.decorators import action
-from rest_framework.exceptions import ValidationError as DRFValidationError
+from rest_framework.exceptions import (
+    PermissionDenied,
+    ValidationError as DRFValidationError,
+)
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -21,7 +24,7 @@ from rest_framework.viewsets import ReadOnlyModelViewSet
 
 from academics.permissions import IsCollegeAdminOrReadOnly
 from academics.views import AcademicStructureViewSet, DepartmentVisibilityQuerysetMixin
-from academics.models import Semester
+from academics.models import Department, Semester
 from resources.views import QueryParameterFilterMixin
 from scheduling.models import (
     BreakPeriod,
@@ -36,6 +39,7 @@ from scheduling.models import (
 from scheduling.permissions import (
     CanEditScheduleDraft,
     CanManageCalendarExceptions,
+    CanReadPublishedAnalytics,
     CanReadScheduleData,
     CanRunCollegeScheduleGeneration,
     CanRunPreSchedulingValidation,
@@ -63,6 +67,7 @@ from scheduling.serializers import (
     PreSchedulingValidationResponseSerializer,
     PublishedScheduleResponseSerializer,
     ScheduleDetailSerializer,
+    ScheduleAnalyticsResponseSerializer,
     ScheduleDraftCollegeInputSerializer,
     ScheduleDraftDepartmentInputSerializer,
     ScheduleDraftRejectedSerializer,
@@ -85,6 +90,7 @@ from scheduling.services.generation import (
     CollegeScheduleGenerator,
     DepartmentScheduleGenerator,
 )
+from scheduling.services.analytics import ScheduleAnalyticsService
 from scheduling.services.manual_edit import (
     BASE_STATE_CODES,
     ManualEditChange,
@@ -499,6 +505,25 @@ WORKFLOW_ACTION_SUMMARIES = {
     ACTION_APPROVE: "Approve a reviewed version",
     ACTION_PUBLISH: "Publish an approved college version as the official timetable",
 }
+
+
+def _resolve_semester_query(request):
+    """Resolve the ``semester`` query parameter of the published routes.
+
+    Shared by the published timetable and the published analytics endpoints so both
+    answer the same way: ``400`` for a missing, non-numeric or unknown semester.
+    """
+    raw_semester = request.query_params.get("semester")
+    if raw_semester in (None, ""):
+        raise DRFValidationError({"semester": "This query parameter is required."})
+    try:
+        semester_id = int(raw_semester)
+    except (TypeError, ValueError) as exc:
+        raise DRFValidationError({"semester": "Use a numeric semester id."}) from exc
+    semester = Semester.objects.filter(pk=semester_id).first()
+    if semester is None:
+        raise DRFValidationError({"semester": "Unknown semester."})
+    return semester
 
 
 def _version_for_response(version_id: int):
@@ -1013,6 +1038,46 @@ class ScheduleVersionViewSet(QueryParameterFilterMixin, ReadOnlyModelViewSet):
         validation = WorkflowVersionValidator(version=version).validate()
         return Response(WorkflowValidationResponseSerializer(validation).data)
 
+    # --- Phase 14: analytics -------------------------------------------------
+
+    @extend_schema(
+        summary="Read analytics of one stored version",
+        description=(
+            "Computes counts, workloads, room usage, gaps and quality figures for this "
+            "exact persisted version. It works for every workflow status and writes "
+            "nothing.\n\n"
+            "The descriptive values (course, department, room, instructor and group "
+            "names, period labels and times) come from the version's snapshot columns, "
+            "so renaming a live record never changes a historical report. The one "
+            "exception is room utilization, which needs a denominator the snapshot does "
+            "not contain: it is computed from **current** room availability and the "
+            "current grid, and every room row says so in ``utilization_basis`` with "
+            "``available_minutes: null`` when no denominator exists.\n\n"
+            "Access is exactly the access the version already has: an out-of-scope "
+            "version answers ``404``."
+        ),
+        responses={
+            200: ScheduleAnalyticsResponseSerializer,
+            401: OpenApiResponse(description="Authentication required."),
+            403: OpenApiResponse(
+                description="This role may not read schedule analytics."
+            ),
+            404: OpenApiResponse(
+                description="Unknown version, or a version outside the caller's scope."
+            ),
+        },
+    )
+    @action(
+        detail=True,
+        methods=["get"],
+        url_path="analytics",
+        permission_classes=[IsAuthenticated, CanReadScheduleData],
+    )
+    def analytics(self, request, pk=None):
+        version = self.get_object()
+        report = ScheduleAnalyticsService.for_version(version).build()
+        return Response(ScheduleAnalyticsResponseSerializer(report).data)
+
     def _perform_workflow_action(self, request, action: str):
         """Run one workflow action and serialize its outcome.
 
@@ -1174,6 +1239,98 @@ class ScheduleVersionViewSet(QueryParameterFilterMixin, ReadOnlyModelViewSet):
 
 
 @extend_schema(tags=SCHEDULING_TAGS)
+class PublishedScheduleAnalyticsView(APIView):
+    """Analytics of the officially published college timetable of one semester.
+
+    The analysed version is the schedule's authoritative ``published_version``, never
+    whichever version happens to carry ``status = PUBLISHED``: earlier publications keep
+    that status as history, and only the pointer says which one is official.
+
+    A college administrator sees the whole college. A department's administrator,
+    scheduler or viewer sees the official entries that concern the department, and the
+    entry set is narrowed *before* aggregation, so no figure is derived from an entry
+    the caller may not see. An instructor is refused: the published timetable endpoint
+    is the instructor-facing source, not this dashboard.
+    """
+
+    permission_classes = [IsAuthenticated, CanReadPublishedAnalytics]
+
+    @extend_schema(
+        summary="Read analytics of the current published college timetable",
+        description=(
+            "Returns the same report shape as the version analytics endpoint, computed "
+            "over the current publication. Department callers get "
+            "``scope: DEPARTMENT``, a ``department_scope`` block that separates the "
+            "sessions their department manages from the joint sessions it merely "
+            "attends, and every other section restricted to the entries they may see.\n\n"
+            "A semester with no publication answers ``404``, matching the published "
+            "timetable endpoint; a missing or unknown semester answers ``400``."
+        ),
+        parameters=[
+            OpenApiParameter(
+                name="semester",
+                type=int,
+                location=OpenApiParameter.QUERY,
+                required=True,
+                description="Semester id whose published timetable to analyse.",
+            )
+        ],
+        responses={
+            200: ScheduleAnalyticsResponseSerializer,
+            400: OpenApiResponse(
+                description="Missing or unknown ``semester`` query parameter."
+            ),
+            401: OpenApiResponse(description="Authentication required."),
+            403: OpenApiResponse(
+                description=(
+                    "This role has no analytics access: instructors use the published "
+                    "timetable endpoint, and a department-scoped account without a "
+                    "department fails closed."
+                )
+            ),
+            404: OpenApiResponse(
+                description="No college schedule of this semester has been published."
+            ),
+        },
+    )
+    def get(self, request):
+        semester = _resolve_semester_query(request)
+        schedule = current_published_college_schedule(semester=semester)
+        if schedule is None:
+            return Response(
+                {
+                    "detail": (
+                        "No college schedule of this semester has been published yet."
+                    )
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        department = None
+        if not request.user.has_cross_department_access:
+            # Fail closed: summaries cannot be narrowed for an account with no
+            # department, and the whole college is out of its reach.
+            if request.user.department_id is None:
+                raise PermissionDenied(
+                    "Your account is not attached to a department, so there is no "
+                    "official timetable scope to analyse."
+                )
+            department = Department.objects.filter(
+                pk=request.user.department_id
+            ).first()
+            if department is None:
+                raise PermissionDenied(
+                    "Your account's department no longer exists, so there is nothing "
+                    "to analyse."
+                )
+
+        report = ScheduleAnalyticsService.for_published(
+            schedule, department=department
+        ).build()
+        return Response(ScheduleAnalyticsResponseSerializer(report).data)
+
+
+@extend_schema(tags=SCHEDULING_TAGS)
 class PublishedScheduleCurrentView(APIView):
     """The officially published college timetable of one semester.
 
@@ -1223,18 +1380,7 @@ class PublishedScheduleCurrentView(APIView):
         },
     )
     def get(self, request):
-        raw_semester = request.query_params.get("semester")
-        if raw_semester in (None, ""):
-            raise DRFValidationError({"semester": "This query parameter is required."})
-        try:
-            semester_id = int(raw_semester)
-        except (TypeError, ValueError) as exc:
-            raise DRFValidationError(
-                {"semester": "Use a numeric semester id."}
-            ) from exc
-        semester = Semester.objects.filter(pk=semester_id).first()
-        if semester is None:
-            raise DRFValidationError({"semester": "Unknown semester."})
+        semester = _resolve_semester_query(request)
 
         schedule = current_published_college_schedule(semester=semester)
         if schedule is None:

@@ -4,9 +4,9 @@ Django REST Framework backend for the College Academic Schedule Planner.
 Provides the project foundation (configuration package, domain app skeletons,
 custom user model, API/OpenAPI plumbing) that later phases build on.
 
-- Current phase: **Phase 9 — department schedule generation** (a preview timetable
-  for one department, built from stored data and solved with CP-SAT). Nothing is
-  persisted: no `Schedule` models exist, and college-wide generation is Phase 10.
+- Current phase: **Phase 14 — schedule reports and analytics** (read-only reports over a
+  stored `ScheduleVersion` and over the officially published timetable). No model is
+  added and nothing is exported yet: report files are Phase 15.
 
 ## Architecture
 
@@ -58,14 +58,16 @@ sch_planner_backend/
 │   │   ├── generation/# blocks, candidates, preferences, preview, service
 │   │   ├── persistence/# snapshots, service (version history writer)
 │   │   ├── manual_edit/# domain, issues, validator, cloning, service
-│   │   └── workflow/  # issues, validation, service, publication
+│   │   ├── workflow/  # issues, validation, service, publication
+│   │   └── analytics/ # domain, summary, workload, rooms, gaps, quality, service
 │   ├── permissions.py # calendar visibility, validation scope, schedule read/edit scope
 │   ├── serializers.py # resource, validation, generation and persistence contracts
 │   ├── views.py       # time-grid viewsets, generation endpoints, schedule read APIs
 │   ├── urls.py        # /api/working-days/, /api/scheduling/generate/, /api/schedules/
 │   └── migrations/    # 0001_calendar_and_time_configuration,
-│                      # 0002_schedule_persistence
-├── reports/           # report exports (empty until later phases)
+│                      # 0002_schedule_persistence,
+│                      # 0003_manual_edit_support, 0004_workflow_publication
+├── reports/           # report exports (Phase 15; empty today)
 ├── tests/             # pytest suite for the whole project
 ├── manage.py
 ├── requirements.txt
@@ -193,6 +195,8 @@ All resource APIs expose the same five operations — `GET` list, `GET` detail,
 | Workflow validation       | `GET /api/schedule-versions/{id}/workflow-validation/` | management roles, in scope |
 | Workflow transitions      | `POST /api/schedule-versions/{id}/submit\|review\|approve\|publish/` | see the workflow section |
 | Published timetable       | `GET /api/published-schedules/current/?semester=` | any authenticated user, filtered by role |
+| Version analytics         | `GET /api/schedule-versions/{id}/analytics/` | schedule read roles, in scope (see the analytics section) |
+| Published analytics       | `GET /api/published-schedules/current/analytics/?semester=` | management roles, filtered by role |
 
 Write ownership in this table is stricter than read visibility for shared
 resources: shared instructors and rooms are readable by the departments they are
@@ -1763,6 +1767,211 @@ endpoint is the only cross-department view.
 - no client-supplied workflow actors or timestamps;
 - no calendar-exception application, and no Railway configuration.
 
+## Schedule reports and analytics
+
+```
+GET /api/schedule-versions/{id}/analytics/
+GET /api/published-schedules/current/analytics/?semester=<id>
+```
+
+Both endpoints answer the same body, computed by the same service:
+
+```json
+{
+  "scope": "COLLEGE",
+  "version": { },
+  "summary": { },
+  "department_scope": null,
+  "department_load": [ ],
+  "instructor_workload": [ ],
+  "room_utilization": [ ],
+  "student_group_load": [ ],
+  "quality": { }
+}
+```
+
+The `version` block names what was analysed: `id`, `version_number`, `status`, `source`,
+`scope` of the schedule it belongs to, its semester, its `created_at` and — for a
+publication — `published_at` and `published_by`. Analytics describe a *stored version*,
+not the live database, so a report is reproducible long after the data behind it was
+renamed or reconfigured.
+
+Analysis is read-only: no model, migration, service or endpoint added by this phase
+writes anything. Entries are loaded with their snapshot children prefetched, so a
+report costs a fixed number of queries rather than one per entry, and it never mutates
+the rows it reads.
+
+### Scope: `COLLEGE` or `DEPARTMENT`
+
+`scope` says how the entry set was narrowed for this caller, not what kind of schedule
+the version is. A management report follows its schedule's own scope. A published
+report is `COLLEGE` for a college administrator and `DEPARTMENT` for a department user,
+whose report carries a `department_scope` block:
+
+| Field | Meaning |
+| --- | --- |
+| `managed_session_count`, `managed_minutes`, `managed_hours` | the department's own teaching |
+| `participating_session_count`, `participating_minutes`, `participating_hours` | joint sessions another department manages that this department's student groups attend |
+| `total_visible_session_count` | every session the caller may see |
+
+The two are kept apart and never summed into one local load, because a joint course is
+not the department's own teaching. A `COLLEGE` report answers `department_scope: null`.
+
+The entry set is filtered *before* aggregation, so a foreign department's sessions never
+contribute to a total, a workload, a room figure or a quality metric.
+
+### Summary
+
+`summary` counts the analysed entry set: `entry_count`, `session_count`,
+`scheduled_minutes` (the authoritative integer figure), `scheduled_hours` (derived),
+`unique_courses`, `unique_teaching_components`, `unique_departments`,
+`unique_instructors`, `unique_rooms`, `unique_student_groups` and `days_used`.
+Hours are always derived from stored minutes and never recomputed from clock strings,
+so a report cannot drift by rounding twice. In this data model one stored entry is one
+placed session, so `entry_count` and `session_count` agree today; both are reported so
+that a future change to that relationship cannot silently change the meaning of either.
+
+### Department load
+
+One row per managing department, ordered by department code then id: component count,
+session count, scheduled minutes and hours, unique courses, instructors, rooms and
+student groups, and `joint_session_count` — the sessions whose persisted groups belong
+to more than one department. A joint session counts once, under the department that
+manages the component; the participating departments see it in their group and
+instructor rows, which is how the work is really distributed.
+
+### Instructor workload
+
+One row per instructor, merged across departments: an instructor teaching for two
+departments is one person, not two identities, and their row lists every managing
+department they teach for (`department_ids`, `department_codes`, `department_count`).
+Each row has session count, the `PRIMARY`/`ASSISTANT` split, scheduled minutes and
+hours, active days, `max_daily_scheduled_minutes` (the heaviest single weekday) and the
+gap figures below. The split comes from the role the version stored, so today's
+teaching assignments cannot rewrite a historical workload.
+
+### Room usage and utilization
+
+One row per room used by the entry set, ordered by room code then id. Usage is
+snapshot-stable: session count, occupied minutes and hours, occupied periods and active
+days all come from the version.
+
+Utilization is **not** snapshot-stable and is labelled as such. The snapshot does not
+contain how much time a room could have been used, so the denominator is today's
+configuration: the active teaching periods of the semester that fall completely inside
+an active room availability window for that weekday. A period counts once even when
+several windows overlap it, so the denominator is capacity rather than a sum of
+overlapping grants.
+
+- `utilization_basis` is `CURRENT_ROOM_AVAILABILITY` on every row, so a live
+  denominator is never mistaken for history;
+- when current configuration cannot supply a basis — the room is gone or inactive, or
+  no period fits inside an availability window — `available_minutes`,
+  `available_hours` and `utilization_percent` are `null` rather than a guess;
+- when the historical timetable occupies more time than today's configuration allows,
+  the percentage is reported above `100` and `configuration_mismatch` is `true`.
+  Clamping to `100` would hide exactly the evidence an administrator needs.
+
+A room a department may only read (shared) still appears if the version placed sessions
+in it: analytics need no write access, and the room's own grants are not consulted.
+
+### Student-group load
+
+One row per persisted student group, ordered by the group's department code, then group
+code, then id: session count, scheduled minutes and hours, active days,
+`managing_department_count` (how many departments teach this group inside the version)
+and the gap figures. Participation and department come from the version's snapshot
+rows, not from today's component/group links, so a report keeps describing the
+timetable that was actually approved.
+
+### Gaps
+
+A gap is free time *between* teaching, seen from one resource's point of view:
+
+```
+08:00-09:30  10:00-11:30   gap 09:30-10:00 = 30 min
+08:00-09:30  (nothing else)  no gap
+```
+
+Intervals come from the persisted per-entry spans, are merged defensively (touching and
+overlapping sessions are one continuous stretch), and are measured between merged
+stretches. Time before a resource's first session and after its last is not a gap. Each
+instructor and group row carries `total_gap_minutes`, `max_gap_minutes` (the largest
+single gap) and `average_gap_minutes_per_active_day`.
+
+### Quality figures
+
+`quality` reports raw, interpretable quantities and deliberately computes **no
+composite score**, because a single opaque "82/100" would hide which of them is bad:
+
+| Field | Meaning |
+| --- | --- |
+| `total_preference_penalty`, `average_preference_penalty_per_session` | sum of the stored `ScheduleEntry.penalty` values, the score the placement was accepted with — never recomputed from today's preference windows |
+| `total_instructor_gap_minutes`, `average_instructor_gap_minutes` | dead time instructors carry, averaged per instructor |
+| `total_student_group_gap_minutes`, `average_student_group_gap_minutes` | dead time students carry, averaged per group |
+| `sessions_by_weekday` | sessions per weekday, with every weekday present so two reports compare position by position |
+| `sessions_by_start_hour` | sessions per distinct start time |
+| `max_sessions_for_one_instructor_day`, `max_sessions_for_one_group_day` | the heaviest single weekday for one resource |
+
+Averages divide by the population they describe (sessions, instructors, groups) and
+report `0.0` rather than an undefined value when that population is empty.
+
+### Snapshot-stable and current-configuration figures
+
+Only one family of figures is not historical, and the contract says so explicitly:
+
+| Category | Source | Fields |
+| --- | --- | --- |
+| Snapshot-stable | the version's entries and snapshot columns | everything except the denominator: counts, workloads, groups, gaps, penalties |
+| Current-configuration | today's rooms, availability and time grid | `available_minutes`, `available_hours`, `utilization_percent`, `configuration_mismatch` |
+
+Renaming a course, room, department, instructor or group changes nothing in a report:
+the display values are the ones the version stored. Changing the calendar grid or a
+room's availability changes utilization only, and the `utilization_basis` label names
+that basis on every row.
+
+### Who may read analytics
+
+`GET /api/schedule-versions/{id}/analytics/` needs the same access the version already
+had — the draft read scoping, so a department user cannot analyse a college draft or
+another department's draft, and an out-of-scope version answers `404` rather than
+disclosing that it exists. An instructor or an abnormally scoped account is refused
+with `403`.
+
+`GET /api/published-schedules/current/analytics/?semester=<id>` is a management view
+over the officially published timetable, so it follows the published-table endpoint's
+scoping but not its audience:
+
+| Caller | Report |
+| --- | --- |
+| college administrator or superuser | the whole published timetable, `scope: COLLEGE` |
+| department administrator, scheduler or viewer | the entries that department manages plus the joint sessions it attends, `scope: DEPARTMENT` |
+| instructor | `403` — the published timetable endpoint is the instructor-facing source, and this phase adds no instructor analytics dashboard |
+| department-scoped account with no department | `403`: summaries cannot be narrowed, so the request fails closed |
+| semester with no publication | `404`, matching the published timetable endpoint |
+| missing or unknown `semester` | `400` |
+
+The analysed version is the schedule's `published_version` pointer, never whichever
+version carries `status = PUBLISHED`: earlier publications keep that status as history,
+and only the pointer says which timetable is official.
+
+### Reused by Phase 15
+
+Report generation is a service first and an endpoint second.
+`ScheduleAnalyticsService.for_version(version)` and
+`ScheduleAnalyticsService.for_published(schedule, department=...)` return value objects
+that render straight to JSON, and the exported documents of Phase 15 will reuse them
+instead of re-deriving numbers from the ORM.
+
+### Not in Phase 14
+
+- no PDF, Excel or CSV export, and no download endpoint;
+- no composite quality score, ranking or recommendation;
+- no instructor analytics dashboard;
+- no stored report: analytics are computed per request and never persisted;
+- no new model, no new field and no migration;
+- no writes of any kind, no caching layer and no background job.
+
 ## Who may write what
 
 | Role | Reads | Writes |
@@ -1858,9 +2067,11 @@ not used.
 - **Phase 13 (done)** — workflow and official publication: submit, review, approve and
   publish with full revalidation, and the authoritative published timetable readable
   by departments and instructors.
-- **Phase 14 (planned)** — reports and export over the published versions.
-- **Later** — manual editing, reports/export, reservations and department
-  regeneration from an authoritative version, PostgreSQL, background jobs, Railway
-  deployment.
+- **Phase 14 (done)** — schedule reports and analytics: read-only management and
+  published analytics over persisted versions, with snapshot-stable counts, workloads,
+  gaps and quality figures, and utilization labelled as current-configuration.
+- **Phase 15 (planned)** — report export over the published versions.
+- **Later** — reservations and department regeneration from an authoritative version,
+  PostgreSQL, background jobs, Railway deployment.
 - **Flutter instructor app** — after the web application, using
   `/api/me/teaching-assignments/` as one of its first endpoints.

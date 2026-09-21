@@ -1439,3 +1439,188 @@ class PublishedScheduleResponseSerializer(serializers.Serializer):
     schedule = ScheduleIdentitySerializer()
     version = PublishedVersionIdentitySerializer()
     entries = ScheduleEntrySerializer(many=True)
+
+
+# --- Phase 14: reports and analytics ----------------------------------------
+
+
+class AnalyticsSnapshotRefSerializer(serializers.Serializer):
+    """A display reference taken from a version's snapshot columns."""
+
+    id = serializers.IntegerField(allow_null=True, required=False)
+    code = serializers.CharField(allow_blank=True, required=False)
+    name = serializers.CharField(allow_blank=True, required=False)
+
+
+class AnalyticsVersionSerializer(serializers.Serializer):
+    """Which stored version a report describes, and when it was produced.
+
+    ``created_at`` is when the timetable version was stored and ``published_at`` when
+    it became official. Neither is the time the report was generated: analytics are
+    computed on request and never stored.
+    """
+
+    schedule_id = serializers.IntegerField()
+    scope = serializers.ChoiceField(
+        source="schedule_scope",
+        choices=ScheduleScope.choices,
+        help_text="Scope of the schedule the version belongs to.",
+    )
+    semester_id = serializers.IntegerField()
+    semester_label = serializers.CharField()
+    id = serializers.IntegerField(source="version_id")
+    version_number = serializers.IntegerField()
+    status = serializers.ChoiceField(choices=ScheduleStatus.choices)
+    source = serializers.ChoiceField(choices=ScheduleVersionSource.choices)
+    created_at = serializers.DateTimeField(allow_null=True, required=False)
+    published_at = serializers.DateTimeField(allow_null=True, required=False)
+    published_by = ScheduleUserSummarySerializer(allow_null=True, required=False)
+
+
+class AnalyticsSummarySerializer(serializers.Serializer):
+    """Headline counts of the analysed entry set."""
+
+    entry_count = serializers.IntegerField()
+    session_count = serializers.IntegerField()
+    scheduled_minutes = serializers.IntegerField(
+        help_text="Authoritative integer arithmetic; hours are derived from it."
+    )
+    scheduled_hours = serializers.FloatField()
+    unique_courses = serializers.IntegerField()
+    unique_teaching_components = serializers.IntegerField()
+    unique_departments = serializers.IntegerField()
+    unique_instructors = serializers.IntegerField()
+    unique_rooms = serializers.IntegerField()
+    unique_student_groups = serializers.IntegerField()
+    days_used = serializers.IntegerField()
+
+
+class AnalyticsDepartmentScopeSerializer(serializers.Serializer):
+    """How a department-scoped report divides the official timetable.
+
+    ``managed`` sessions are the department's own teaching; ``participating`` are joint
+    sessions another department manages that this department's groups attend. The two
+    are never added into one local load.
+    """
+
+    department = AnalyticsSnapshotRefSerializer()
+    managed_session_count = serializers.IntegerField()
+    participating_session_count = serializers.IntegerField()
+    total_visible_session_count = serializers.IntegerField()
+    managed_minutes = serializers.IntegerField()
+    managed_hours = serializers.FloatField()
+    participating_minutes = serializers.IntegerField()
+    participating_hours = serializers.FloatField()
+
+
+class AnalyticsDepartmentLoadSerializer(serializers.Serializer):
+    """Scheduled load of one managing department."""
+
+    department = AnalyticsSnapshotRefSerializer()
+    component_count = serializers.IntegerField()
+    session_count = serializers.IntegerField()
+    scheduled_minutes = serializers.IntegerField()
+    scheduled_hours = serializers.FloatField()
+    unique_courses = serializers.IntegerField()
+    unique_instructors = serializers.IntegerField()
+    unique_rooms = serializers.IntegerField()
+    unique_student_groups = serializers.IntegerField()
+    joint_session_count = serializers.IntegerField(
+        help_text="Sessions whose persisted groups belong to more than one department."
+    )
+
+
+class AnalyticsInstructorWorkloadSerializer(serializers.Serializer):
+    """One instructor's scheduled load, merged across departments."""
+
+    instructor = AnalyticsSnapshotRefSerializer()
+    session_count = serializers.IntegerField()
+    primary_session_count = serializers.IntegerField()
+    assistant_session_count = serializers.IntegerField()
+    scheduled_minutes = serializers.IntegerField()
+    scheduled_hours = serializers.FloatField()
+    days_used = serializers.IntegerField()
+    max_daily_scheduled_minutes = serializers.IntegerField()
+    max_daily_scheduled_hours = serializers.FloatField()
+    department_count = serializers.IntegerField()
+    department_ids = serializers.ListField(child=serializers.IntegerField())
+    department_codes = serializers.ListField(child=serializers.CharField())
+    total_gap_minutes = serializers.IntegerField()
+    average_gap_minutes_per_active_day = serializers.FloatField()
+    max_gap_minutes = serializers.IntegerField()
+
+
+class AnalyticsRoomUsageSerializer(serializers.Serializer):
+    """Snapshot usage of one room, plus its current-configuration denominator.
+
+    ``available_minutes`` and ``utilization_percent`` describe today's configuration,
+    which is why ``utilization_basis`` names it. When current configuration offers no
+    denominator both are null, and when the historical schedule occupies more time than
+    today's grid allows the percentage is reported above 100 with
+    ``configuration_mismatch`` set rather than being clamped.
+    """
+
+    room = AnalyticsSnapshotRefSerializer()
+    session_count = serializers.IntegerField()
+    occupied_minutes = serializers.IntegerField()
+    occupied_hours = serializers.FloatField()
+    occupied_slot_count = serializers.IntegerField()
+    days_used = serializers.IntegerField()
+    utilization_basis = serializers.CharField()
+    available_minutes = serializers.IntegerField(allow_null=True, required=False)
+    available_hours = serializers.FloatField(allow_null=True, required=False)
+    utilization_percent = serializers.FloatField(allow_null=True, required=False)
+    configuration_mismatch = serializers.BooleanField()
+
+
+class AnalyticsStudentGroupLoadSerializer(serializers.Serializer):
+    """One student group's scheduled load, from the version's persisted rows."""
+
+    group = AnalyticsSnapshotRefSerializer()
+    department = AnalyticsSnapshotRefSerializer()
+    session_count = serializers.IntegerField()
+    scheduled_minutes = serializers.IntegerField()
+    scheduled_hours = serializers.FloatField()
+    days_used = serializers.IntegerField()
+    managing_department_count = serializers.IntegerField()
+    total_gap_minutes = serializers.IntegerField()
+    average_gap_minutes_per_active_day = serializers.FloatField()
+    max_gap_minutes = serializers.IntegerField()
+
+
+class AnalyticsQualitySerializer(serializers.Serializer):
+    """Interpretable quality figures, with no composite score."""
+
+    total_preference_penalty = serializers.IntegerField(
+        help_text="Sum of the stored per-placement penalties; never recomputed."
+    )
+    average_preference_penalty_per_session = serializers.FloatField()
+    total_instructor_gap_minutes = serializers.IntegerField()
+    average_instructor_gap_minutes = serializers.FloatField()
+    total_student_group_gap_minutes = serializers.IntegerField()
+    average_student_group_gap_minutes = serializers.FloatField()
+    sessions_by_weekday = serializers.DictField(child=serializers.IntegerField())
+    sessions_by_start_hour = serializers.DictField(child=serializers.IntegerField())
+    max_sessions_for_one_instructor_day = serializers.IntegerField()
+    max_sessions_for_one_group_day = serializers.IntegerField()
+
+
+class ScheduleAnalyticsResponseSerializer(serializers.Serializer):
+    """Response body of both analytics endpoints.
+
+    ``scope`` says how the entry set was narrowed for this caller, not what kind of
+    schedule the version belongs to: a department administrator reading the published
+    college timetable gets ``DEPARTMENT`` scope and a ``department_scope`` block.
+    """
+
+    scope = serializers.ChoiceField(choices=ScheduleScope.choices)
+    version = AnalyticsVersionSerializer()
+    summary = AnalyticsSummarySerializer()
+    department_scope = AnalyticsDepartmentScopeSerializer(
+        allow_null=True, required=False
+    )
+    department_load = AnalyticsDepartmentLoadSerializer(many=True)
+    instructor_workload = AnalyticsInstructorWorkloadSerializer(many=True)
+    room_utilization = AnalyticsRoomUsageSerializer(many=True)
+    student_group_load = AnalyticsStudentGroupLoadSerializer(many=True)
+    quality = AnalyticsQualitySerializer()
