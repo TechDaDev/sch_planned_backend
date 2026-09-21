@@ -35,6 +35,11 @@ and joint participation in another department's course grants no draft visibilit
 Phase 12 adds manual editing of a draft. It is a smaller role set than reading, and
 it deliberately reuses the read scoping for reachability: whatever a role cannot see
 it also cannot edit, so the two rules cannot disagree.
+
+Phase 13 adds workflow and publication. Advancing a stage needs a management role
+(``VIEWER`` and ``INSTRUCTOR`` cannot), which stage a role may advance depends on the
+schedule's scope, and the published timetable gets its own visibility rule because it
+is the first artefact meant to be read outside schedule management.
 """
 
 from django.db import models
@@ -218,6 +223,37 @@ def can_edit_schedule_data(user) -> bool:
     return bool(user.is_superuser or user.role in SCHEDULE_EDIT_ROLES)
 
 
+#: Roles that may move a schedule version along the workflow.
+#: ``VIEWER`` is read-only and ``INSTRUCTOR`` has no draft-management authority.
+SCHEDULE_WORKFLOW_ROLES = frozenset(
+    {UserRole.COLLEGE_ADMIN, UserRole.DEPARTMENT_ADMIN, UserRole.SCHEDULER}
+)
+
+
+def can_run_schedule_workflow(user) -> bool:
+    """True when the user's role may advance a workflow stage at all."""
+    return bool(user.is_superuser or user.role in SCHEDULE_WORKFLOW_ROLES)
+
+
+class CanRunScheduleWorkflow(BasePermission):
+    """Role gate for the workflow actions and the workflow validation report.
+
+    The role decides whether the endpoints are reachable. The finer question - may
+    this role advance *this* stage on *this* schedule - is answered by the workflow
+    service, because the answer depends on the schedule's scope as well as the role:
+    a department administrator may submit their own draft but never review or approve
+    it, and only a college administrator may move a college-wide schedule.
+
+    Reachability reuses the read-scoped queryset, so a version the caller cannot read
+    answers ``404`` rather than a disclosing ``403``.
+    """
+
+    def has_permission(self, request, view) -> bool:
+        if not is_authenticated_active_user(request):
+            return False
+        return can_run_schedule_workflow(request.user)
+
+
 class CanEditScheduleDraft(BasePermission):
     """Role gate for the manual-edit validate and apply endpoints.
 
@@ -280,13 +316,16 @@ def resolve_validation_scope(user, *, scope, department):
 __all__ = [
     "SCHEDULE_EDIT_ROLES",
     "SCHEDULE_READ_ROLES",
+    "SCHEDULE_WORKFLOW_ROLES",
     "CanEditScheduleDraft",
     "CanManageCalendarExceptions",
     "CanReadScheduleData",
     "CanRunCollegeScheduleGeneration",
     "CanRunPreSchedulingValidation",
+    "CanRunScheduleWorkflow",
     "can_edit_schedule_data",
     "can_read_schedule_data",
+    "can_run_schedule_workflow",
     "resolve_validation_scope",
     "visible_calendar_exceptions_filter",
     "visible_schedules_filter",

@@ -135,11 +135,16 @@ class ScheduleEntryStudentGroupInline(admin.TabularInline):
 class ScheduleAdmin(admin.ModelAdmin):
     """Logical timetables. Created by generating a draft, never by hand."""
 
-    list_display = ("id", "semester", "scope", "department", "created_at")
+    list_display = ("id", "semester", "scope", "department", "published_version", "created_at")
     list_filter = ("scope", "semester")
     search_fields = ("department__code", "department__name")
-    list_select_related = ("semester", "semester__academic_year", "department")
-    readonly_fields = ("created_at", "updated_at")
+    list_select_related = (
+        "semester",
+        "semester__academic_year",
+        "department",
+        "published_version",
+    )
+    readonly_fields = ("created_at", "updated_at", "published_version")
 
 
 @admin.register(ScheduleVersion)
@@ -159,7 +164,17 @@ class ScheduleVersionAdmin(admin.ModelAdmin):
     list_filter = ("status", "source", "solver_status", "schedule__scope")
     search_fields = ("notes",)
     list_select_related = ("schedule", "schedule__semester", "created_by", "parent_version")
-    readonly_fields = ("created_at",)
+    readonly_fields = (
+        "created_at",
+        "submitted_by",
+        "submitted_at",
+        "reviewed_by",
+        "reviewed_at",
+        "approved_by",
+        "approved_at",
+        "published_by",
+        "published_at",
+    )
 
     def has_change_permission(self, request, obj=None) -> bool:
         """History is append-only, so the admin never edits a version.

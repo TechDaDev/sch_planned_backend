@@ -10,7 +10,7 @@ service, and read through scoped, read-only viewsets.
 from dataclasses import replace
 
 from django.db.models import Count, OuterRef, Subquery
-from drf_spectacular.utils import OpenApiResponse, extend_schema
+from drf_spectacular.utils import OpenApiParameter, OpenApiResponse, extend_schema
 from rest_framework import status
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError as DRFValidationError
@@ -21,6 +21,7 @@ from rest_framework.viewsets import ReadOnlyModelViewSet
 
 from academics.permissions import IsCollegeAdminOrReadOnly
 from academics.views import AcademicStructureViewSet, DepartmentVisibilityQuerysetMixin
+from academics.models import Semester
 from resources.views import QueryParameterFilterMixin
 from scheduling.models import (
     BreakPeriod,
@@ -38,6 +39,7 @@ from scheduling.permissions import (
     CanReadScheduleData,
     CanRunCollegeScheduleGeneration,
     CanRunPreSchedulingValidation,
+    CanRunScheduleWorkflow,
     resolve_validation_scope,
     visible_calendar_exceptions_filter,
     visible_schedules_filter,
@@ -59,6 +61,7 @@ from scheduling.serializers import (
     ManualEditValidationResponseSerializer,
     PreSchedulingValidationInputSerializer,
     PreSchedulingValidationResponseSerializer,
+    PublishedScheduleResponseSerializer,
     ScheduleDetailSerializer,
     ScheduleDraftCollegeInputSerializer,
     ScheduleDraftDepartmentInputSerializer,
@@ -69,8 +72,12 @@ from scheduling.serializers import (
     ScheduleSummarySerializer,
     ScheduleVersionDetailSerializer,
     ScheduleVersionSummarySerializer,
+    ScheduleWorkflowActionSerializer,
     TimeSlotSerializer,
     TimeSlotWriteSerializer,
+    WorkflowRejectedSerializer,
+    WorkflowTransitionResponseSerializer,
+    WorkflowValidationResponseSerializer,
     WorkingDaySerializer,
     WorkingDayWriteSerializer,
 )
@@ -86,6 +93,16 @@ from scheduling.services.manual_edit import (
 )
 from scheduling.services.persistence import SchedulePersistenceService
 from scheduling.services.validation import PreSchedulingValidator, ValidationScope
+from scheduling.services.workflow import (
+    ACTION_APPROVE,
+    ACTION_PUBLISH,
+    ACTION_REVIEW,
+    ACTION_SUBMIT,
+    ScheduleWorkflowService,
+    WorkflowVersionValidator,
+    current_published_college_schedule,
+    published_entries,
+)
 
 CALENDAR_TAGS = ["calendar"]
 SCHEDULING_TAGS = ["scheduling"]
@@ -475,6 +492,35 @@ def _base_state_issue(validation):
     return None
 
 
+#: Workflow actions and the one-line summary each endpoint documents.
+WORKFLOW_ACTION_SUMMARIES = {
+    ACTION_SUBMIT: "Submit a draft version for review",
+    ACTION_REVIEW: "Mark a submitted version as reviewed",
+    ACTION_APPROVE: "Approve a reviewed version",
+    ACTION_PUBLISH: "Publish an approved college version as the official timetable",
+}
+
+
+def _version_for_response(version_id: int):
+    """Re-read a version with everything its detail response needs, in one query."""
+    return (
+        ScheduleVersion.objects.select_related(
+            "created_by",
+            "parent_version",
+            "submitted_by",
+            "reviewed_by",
+            "approved_by",
+            "published_by",
+            "schedule",
+            "schedule__semester",
+            "schedule__semester__academic_year",
+            "schedule__department",
+        )
+        .annotate(entry_count=Count("entries"))
+        .get(pk=version_id)
+    )
+
+
 def _schedule_annotations(queryset):
     """Add the newest-version summary fields a schedule list needs.
 
@@ -741,7 +787,10 @@ class ScheduleViewSet(QueryParameterFilterMixin, ReadOnlyModelViewSet):
     def get_queryset(self):
         queryset = _schedule_annotations(
             Schedule.objects.select_related(
-                "semester", "semester__academic_year", "department"
+                "semester",
+                "semester__academic_year",
+                "department",
+                "published_version",
             )
         )
         return queryset.filter(visible_schedules_filter(self.request.user))
@@ -934,3 +983,279 @@ class ScheduleVersionViewSet(QueryParameterFilterMixin, ReadOnlyModelViewSet):
                 status=status.HTTP_409_CONFLICT,
             )
         return Response(ManualEditApplyResponseSerializer(result).data)
+
+    # --- Phase 13: workflow --------------------------------------------------
+
+    @extend_schema(
+        summary="Validate a stored version against current configuration",
+        description=(
+            "Reports whether the stored timetable can still advance through the "
+            "workflow. Every entry is measured against today's data: the component's "
+            "academic chain, its current weekly session count and session length, its "
+            "current teaching assignments and student groups, the stored room's "
+            "current requirement and availability, every instructor's eligibility and "
+            "availability, the current time grid, and the internal collisions of the "
+            "version.\n\n"
+            "This endpoint writes nothing. ``valid`` is true only when nothing blocks "
+            "progression; every reported issue is a blocking ERROR. The publication "
+            "completeness rule applies when publishing, not here."
+        ),
+        responses=WorkflowValidationResponseSerializer,
+    )
+    @action(
+        detail=True,
+        methods=["get"],
+        url_path="workflow-validation",
+        permission_classes=[IsAuthenticated, CanRunScheduleWorkflow],
+    )
+    def workflow_validation(self, request, pk=None):
+        version = self.get_object()
+        validation = WorkflowVersionValidator(version=version).validate()
+        return Response(WorkflowValidationResponseSerializer(validation).data)
+
+    def _perform_workflow_action(self, request, action: str):
+        """Run one workflow action and serialize its outcome.
+
+        The view validates the (empty) body, hands the work to the service and maps a
+        refusal to ``409``. Every rule about who may advance which stage, and whether
+        the stored timetable is still valid, lives in the service.
+        """
+        version = self.get_object()
+        serializer = ScheduleWorkflowActionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        result = ScheduleWorkflowService(
+            version=version, action=action, user=request.user
+        ).transition()
+        if not result.applied:
+            return Response(
+                WorkflowRejectedSerializer(result).data,
+                status=status.HTTP_409_CONFLICT,
+            )
+        return Response(
+            WorkflowTransitionResponseSerializer(
+                replace(result, version=_version_for_response(result.version.pk))
+            ).data
+        )
+
+    @extend_schema(
+        summary="Submit a draft version for review",
+        description=(
+            "Moves the latest ``DRAFT`` version of a schedule to ``SUBMITTED`` and "
+            "records who did it and when. A college administrator may submit any "
+            "schedule; a department administrator or scheduler may submit their own "
+            "department's.\n\n"
+            "The whole version is revalidated first, so a timetable that has decayed "
+            "since it was created answers ``409`` with "
+            "``SCHEDULE_VALIDATION_FAILED``. Only the status and the submit metadata "
+            "change: no entry, period, instructor, room or snapshot is touched."
+        ),
+        request=ScheduleWorkflowActionSerializer,
+        responses={
+            200: WorkflowTransitionResponseSerializer,
+            400: OpenApiResponse(description="Unsupported field in the body."),
+            401: OpenApiResponse(description="Authentication required."),
+            403: OpenApiResponse(
+                description="This role may not move this schedule through the workflow."
+            ),
+            404: OpenApiResponse(
+                description="Unknown version, or a version outside the caller's scope."
+            ),
+            409: WorkflowRejectedSerializer,
+        },
+    )
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="submit",
+        permission_classes=[IsAuthenticated, CanRunScheduleWorkflow],
+    )
+    def submit(self, request, pk=None):
+        return self._perform_workflow_action(request, ACTION_SUBMIT)
+
+    @extend_schema(
+        summary="Mark a submitted version as reviewed",
+        description=(
+            "Moves the latest ``SUBMITTED`` version to ``REVIEWED``. Only a college "
+            "administrator or superuser may review: a department administrator cannot "
+            "review their own department's timetable. The version is revalidated "
+            "first, and only the status and the review metadata change."
+        ),
+        request=ScheduleWorkflowActionSerializer,
+        responses={
+            200: WorkflowTransitionResponseSerializer,
+            400: OpenApiResponse(description="Unsupported field in the body."),
+            401: OpenApiResponse(description="Authentication required."),
+            403: OpenApiResponse(
+                description="This role may not review this schedule."
+            ),
+            404: OpenApiResponse(
+                description="Unknown version, or a version outside the caller's scope."
+            ),
+            409: WorkflowRejectedSerializer,
+        },
+    )
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="review",
+        permission_classes=[IsAuthenticated, CanRunScheduleWorkflow],
+    )
+    def review(self, request, pk=None):
+        return self._perform_workflow_action(request, ACTION_REVIEW)
+
+    @extend_schema(
+        summary="Approve a reviewed version",
+        description=(
+            "Moves the latest ``REVIEWED`` version to ``APPROVED``. Only a college "
+            "administrator or superuser may approve, for department and college "
+            "schedules alike. The version is revalidated first, and only the status "
+            "and the approval metadata change."
+        ),
+        request=ScheduleWorkflowActionSerializer,
+        responses={
+            200: WorkflowTransitionResponseSerializer,
+            400: OpenApiResponse(description="Unsupported field in the body."),
+            401: OpenApiResponse(description="Authentication required."),
+            403: OpenApiResponse(
+                description="This role may not approve this schedule."
+            ),
+            404: OpenApiResponse(
+                description="Unknown version, or a version outside the caller's scope."
+            ),
+            409: WorkflowRejectedSerializer,
+        },
+    )
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="approve",
+        permission_classes=[IsAuthenticated, CanRunScheduleWorkflow],
+    )
+    def approve(self, request, pk=None):
+        return self._perform_workflow_action(request, ACTION_APPROVE)
+
+    @extend_schema(
+        summary="Publish an approved college version as the official timetable",
+        description=(
+            "Makes the latest ``APPROVED`` version of a **college** schedule the "
+            "official timetable: its status becomes ``PUBLISHED``, the publish metadata "
+            "is recorded, and the schedule's authoritative ``published_version`` pointer "
+            "moves to it, all in one transaction.\n\n"
+            "A department schedule answers ``409`` with "
+            "``DEPARTMENT_SCHEDULE_NOT_PUBLISHABLE``: department schedules are approved "
+            "inside the college but never become the authoritative timetable. An empty "
+            "version answers ``409`` with ``EMPTY_SCHEDULE_CANNOT_BE_PUBLISHED``.\n\n"
+            "Publishing a newer version leaves earlier published versions "
+            "``PUBLISHED``; the pointer, not the status, says which one is current, and "
+            "no entry of any earlier version is deleted or modified."
+        ),
+        request=ScheduleWorkflowActionSerializer,
+        responses={
+            200: WorkflowTransitionResponseSerializer,
+            400: OpenApiResponse(description="Unsupported field in the body."),
+            401: OpenApiResponse(description="Authentication required."),
+            403: OpenApiResponse(
+                description="Only a college administrator may publish."
+            ),
+            404: OpenApiResponse(
+                description="Unknown version, or a version outside the caller's scope."
+            ),
+            409: WorkflowRejectedSerializer,
+        },
+    )
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="publish",
+        permission_classes=[IsAuthenticated, CanRunScheduleWorkflow],
+    )
+    def publish(self, request, pk=None):
+        return self._perform_workflow_action(request, ACTION_PUBLISH)
+
+
+@extend_schema(tags=SCHEDULING_TAGS)
+class PublishedScheduleCurrentView(APIView):
+    """The officially published college timetable of one semester.
+
+    This is the first endpoint meant to be consumed outside schedule management, so it
+    has its own visibility rule instead of reusing draft scoping: a college
+    administrator sees every entry, a department's users see the entries their
+    department manages or whose student groups belong to it, and an instructor sees the
+    sessions they teach. Everybody else sees an empty list, and a caller without a
+    department sees nothing at all.
+
+    Entries are rendered from the published version's stored snapshots, because the
+    official timetable is the approved version, not a live view of today's names.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        summary="Read the current published college timetable",
+        description=(
+            "Returns the current authoritative college publication for a semester: the "
+            "schedule, the published version identity and the entries the caller may "
+            "see. The authoritative version comes from the schedule's "
+            "``published_version`` pointer, never from a ``status=PUBLISHED`` query, "
+            "because earlier published versions keep that status as history.\n\n"
+            "A semester without a published college schedule answers ``404``. A caller "
+            "with no published visibility receives an empty ``entries`` list rather "
+            "than another department's or another instructor's timetable."
+        ),
+        parameters=[
+            OpenApiParameter(
+                name="semester",
+                type=int,
+                location=OpenApiParameter.QUERY,
+                required=True,
+                description="Semester id to read the official timetable for.",
+            )
+        ],
+        responses={
+            200: PublishedScheduleResponseSerializer,
+            400: OpenApiResponse(
+                description="Missing or unknown ``semester`` query parameter."
+            ),
+            401: OpenApiResponse(description="Authentication required."),
+            404: OpenApiResponse(
+                description="No college schedule of this semester has been published."
+            ),
+        },
+    )
+    def get(self, request):
+        raw_semester = request.query_params.get("semester")
+        if raw_semester in (None, ""):
+            raise DRFValidationError({"semester": "This query parameter is required."})
+        try:
+            semester_id = int(raw_semester)
+        except (TypeError, ValueError) as exc:
+            raise DRFValidationError(
+                {"semester": "Use a numeric semester id."}
+            ) from exc
+        semester = Semester.objects.filter(pk=semester_id).first()
+        if semester is None:
+            raise DRFValidationError({"semester": "Unknown semester."})
+
+        schedule = current_published_college_schedule(semester=semester)
+        if schedule is None:
+            return Response(
+                {
+                    "detail": (
+                        "No college schedule of this semester has been published yet."
+                    )
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        version = schedule.published_version
+        entries = list(published_entries(version=version, user=request.user))
+        return Response(
+            PublishedScheduleResponseSerializer(
+                {
+                    "semester": semester,
+                    "schedule": schedule,
+                    "version": version,
+                    "entries": entries,
+                }
+            ).data
+        )

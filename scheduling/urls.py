@@ -11,6 +11,7 @@ from scheduling.views import (
     DepartmentScheduleDraftView,
     DepartmentScheduleGenerationView,
     PreSchedulingValidationView,
+    PublishedScheduleCurrentView,
     ScheduleVersionViewSet,
     ScheduleViewSet,
     TimeSlotViewSet,
@@ -66,6 +67,14 @@ urlpatterns = [
         "schedules/generate-college-draft/",
         CollegeScheduleDraftView.as_view(),
         name="college-schedule-draft",
+    ),
+    # Phase 13: the official timetable, readable outside schedule management. It is an
+    # action path rather than a collection because there is exactly one current
+    # publication per semester.
+    path(
+        "published-schedules/current/",
+        PublishedScheduleCurrentView.as_view(),
+        name="published-schedule-current",
     ),
     *router.urls,
 ]

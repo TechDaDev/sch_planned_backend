@@ -57,7 +57,8 @@ sch_planner_backend/
 │   │   ├── solver/    # domain, validator, model_builder, solver, result
 │   │   ├── generation/# blocks, candidates, preferences, preview, service
 │   │   ├── persistence/# snapshots, service (version history writer)
-│   │   └── manual_edit/# domain, issues, validator, cloning, service
+│   │   ├── manual_edit/# domain, issues, validator, cloning, service
+│   │   └── workflow/  # issues, validation, service, publication
 │   ├── permissions.py # calendar visibility, validation scope, schedule read/edit scope
 │   ├── serializers.py # resource, validation, generation and persistence contracts
 │   ├── views.py       # time-grid viewsets, generation endpoints, schedule read APIs
@@ -189,6 +190,9 @@ All resource APIs expose the same five operations — `GET` list, `GET` detail,
 | Schedule reads            | `GET /api/schedules/`, `/api/schedule-versions/` | college admin, or own-department drafts |
 | Manual edit validate      | `POST /api/schedule-versions/{id}/validate-manual-edit/` | college admin, or own-department draft |
 | Manual edit apply         | `POST /api/schedule-versions/{id}/manual-edit/` | college admin, or own-department draft |
+| Workflow validation       | `GET /api/schedule-versions/{id}/workflow-validation/` | management roles, in scope |
+| Workflow transitions      | `POST /api/schedule-versions/{id}/submit\|review\|approve\|publish/` | see the workflow section |
+| Published timetable       | `GET /api/published-schedules/current/?semester=` | any authenticated user, filtered by role |
 
 Write ownership in this table is stricter than read visibility for shared
 resources: shared instructors and rooms are readable by the departments they are
@@ -1621,6 +1625,144 @@ free path makes the re-check inside that transaction cheap.
   weekly placement, matching the earlier phases;
 - no published-version reservations, and no Railway configuration.
 
+## Schedule workflow and official publication
+
+```
+POST /api/schedule-versions/{id}/submit/
+POST /api/schedule-versions/{id}/review/
+POST /api/schedule-versions/{id}/approve/
+POST /api/schedule-versions/{id}/publish/
+GET  /api/schedule-versions/{id}/workflow-validation/
+GET  /api/published-schedules/current/?semester=<id>
+```
+
+A stored version moves along one forward-only chain:
+
+```
+DRAFT -> SUBMITTED -> REVIEWED -> APPROVED -> PUBLISHED
+```
+
+There is no `PATCH status`, no skipping a stage and no backwards move. A transition
+writes workflow metadata only: the version's status and that stage's own actor and
+timestamp. No entry, period, instructor, room, student group, candidate id, session id
+or snapshot is ever touched by a workflow action.
+
+### Who may advance which stage
+
+| Schedule | Submit | Review | Approve | Publish |
+| --- | --- | --- | --- | --- |
+| Department | college admin, or that department's admin/scheduler | college admin or superuser | college admin or superuser | never |
+| College | college admin or superuser | college admin or superuser | college admin or superuser | college admin or superuser |
+
+A department administrator or scheduler may submit their own draft but cannot review
+or approve it, because reviewing your own timetable is not a review. Publishing a
+department schedule answers `409 DEPARTMENT_SCHEDULE_NOT_PUBLISHABLE`: department
+schedules are approved inside the college but never become the authoritative
+timetable. `VIEWER` is read-only and `INSTRUCTOR` has no draft-management authority,
+so neither can move a stage; a department-scoped account without a department fails
+closed. Reachability reuses the draft read scoping, so a version a caller cannot read
+answers `404` rather than disclosing that it exists.
+
+### Latest version only
+
+Only the newest version of a schedule may advance. Editing an older one is refused
+with `409 STALE_VERSION`, which prevents an obsolete timetable from being approved by
+a browser that still holds stale state. Creating a newer draft therefore makes an
+older `SUBMITTED` version stale immediately; its historical status and metadata stay
+as they were. The check runs again inside the write transaction, under a
+`select_for_update()` lock on the schedule row, together with a re-check that the
+version is still in the expected current status.
+
+### Every forward step revalidates the whole version
+
+A stored snapshot can decay: an instructor loses a sharing grant, a room is
+deactivated or withdrawn, availability changes, a component's weekly hours or session
+length change, the teaching assignment is replaced, student groups move, or the time
+grid is re-cut. Submitting, reviewing, approving and publishing each run the full
+stored-version validation first, and a failure answers `409` with
+`SCHEDULE_VALIDATION_FAILED` and the issues inline, changing nothing.
+
+`GET /api/schedule-versions/{id}/workflow-validation/` returns the same report
+without writing. Every reported issue is a blocking `ERROR`:
+
+- `INACTIVE_ACADEMIC_DEPENDENCY` — the component, offering, course or managing
+department is no longer active;
+- `SESSION_COUNT_MISMATCH`, `SESSION_DURATION_MISMATCH` — the component's current
+  weekly sessions or session length differ from what the version was built from;
+- `TEACHING_ASSIGNMENT_CHANGED`, `STUDENT_GROUP_CONFIGURATION_CHANGED`,
+  `STUDENT_GROUP_INACTIVE` — the persisted members no longer match today's
+  configuration, or a group left the academic structure;
+- `INSTRUCTOR_INACTIVE`, `INSTRUCTOR_NOT_ELIGIBLE`, `INSTRUCTOR_UNAVAILABLE` — the
+  stored instructors are gone, no longer allowed to teach for the managing department,
+  or no longer available for the stored periods;
+- `ROOM_INACTIVE`, `ROOM_NOT_ELIGIBLE`, `ROOM_REQUIREMENT_UNSATISFIED`,
+  `ROOM_UNAVAILABLE` — the stored room fails today's activity, sharing, requirement or
+  availability rules;
+- `TIME_SLOT_INACTIVE`, `TIME_SLOT_WRONG_SEMESTER`, `TIME_SLOT_CONFIGURATION_CHANGED`
+  — a saved period is gone, moved to another semester, or was redefined so the stored
+  placement no longer matches the calendar;
+- `INSTRUCTOR_CONFLICT`, `ROOM_CONFLICT`, `STUDENT_GROUP_CONFLICT`,
+  `COMPONENT_CONFLICT` — the version collides with itself.
+
+Issues are ordered by code, entry, conflicting entry and details, and duplicates are
+merged, so repeated validation of unchanged data returns the same report.
+
+### Publication
+
+Publishing requires a college schedule with an `APPROVED` latest version and
+`COLLEGE_ADMIN` (or superuser) authority. In one transaction the version becomes
+`PUBLISHED` with its publish metadata, and the schedule's `published_version` pointer
+moves to it. An empty version is refused with `EMPTY_SCHEDULE_CANNOT_BE_PUBLISHED`,
+because an accidentally empty official timetable is worse than a refusal.
+
+`Schedule.published_version` is the authoritative pointer. It is never inferred from
+`status = PUBLISHED`, because earlier publications keep that status as history:
+
+```
+V3 PUBLISHED   (historical)
+V4 DRAFT
+V5 PUBLISHED   -> schedule.published_version = V5
+```
+
+After V5 publishes, V3 is still `PUBLISHED`, its status is not rewritten, and none of
+its entries are deleted or modified. Creating or editing a draft never clears the
+pointer, so the official timetable stays the last published version until a newer one
+reaches `PUBLISHED`. Manual editing still applies to the latest `DRAFT` version only,
+so a submitted version can no longer be edited by hand; corrections require a new
+draft, which then walks the chain again.
+
+### Reading the official timetable
+
+`GET /api/published-schedules/current/?semester=<id>` returns the current publication
+of that semester: the schedule identity, the published version, and the entries the
+caller may see.
+
+- college administrator or superuser: every entry;
+- a department's administrator, scheduler or viewer: the entries that department
+  manages, plus the joint sessions foreign departments manage whose student groups
+  belong to it;
+- an instructor linked to an instructor profile: the sessions that instructor teaches,
+  taken from the persisted instructor rows — the safe foundation for the instructor
+  app;
+- an instructor without a linked profile: an empty list, never somebody else's
+  timetable;
+- a department-scoped account without a department: nothing;
+- an unknown or missing `semester`: `400`; no published college schedule yet: `404`.
+
+Entries are rendered from the published version's stored snapshots, so the official
+timetable keeps the course, room, department, instructor, group and period values that
+were approved even after the live records are renamed. Draft management privacy is
+unchanged: department users still cannot read a college draft, and the published
+endpoint is the only cross-department view.
+
+### Not in Phase 13
+
+- no reports, PDF/Excel export or generic audit log;
+- no change requests, notifications, or automatic rejection and rollback;
+- no `DELETE` for schedules, versions, entries or publication history;
+- no client-supplied workflow actors or timestamps;
+- no calendar-exception application, and no Railway configuration.
+
 ## Who may write what
 
 | Role | Reads | Writes |
@@ -1713,8 +1855,10 @@ not used.
   nothing published.
 - **Phase 12 (done)** — validated manual editing of a draft: a validation endpoint and
   a copy-on-write apply endpoint that append a `MANUAL_EDIT` version. No workflow yet.
-- **Phase 13 (planned)** — workflow transitions and publication over the stored
-  versions.
+- **Phase 13 (done)** — workflow and official publication: submit, review, approve and
+  publish with full revalidation, and the authoritative published timetable readable
+  by departments and instructors.
+- **Phase 14 (planned)** — reports and export over the published versions.
 - **Later** — manual editing, reports/export, reservations and department
   regeneration from an authoritative version, PostgreSQL, background jobs, Railway
   deployment.

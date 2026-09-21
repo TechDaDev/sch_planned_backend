@@ -18,6 +18,8 @@ endpoint has no ``scope`` field, and the college-wide endpoint has no
 from drf_spectacular.utils import PolymorphicProxySerializer, extend_schema_field
 from rest_framework import serializers
 
+from typing import Any
+
 from academics.models import Department, Semester, StudentGroup, Weekday
 from academics.permissions import user_can_manage_department
 from academics.serializers import (
@@ -948,9 +950,16 @@ class ScheduleDetailSerializer(ScheduleSummarySerializer):
     The full history is served by ``/api/schedules/{id}/versions/`` and the entries
     of a version by ``/api/schedule-versions/{id}/entries/``, so this response stays
     a timetable *identity*, not a timetable.
+
+    ``published_version`` is the authoritative pointer of a college schedule. It is
+    the only thing that says which version is current: several versions may carry the
+    ``PUBLISHED`` status over time, and only this one is official.
     """
 
     latest_version = serializers.SerializerMethodField()
+    published_version = serializers.SerializerMethodField()
+    published_version_number = serializers.SerializerMethodField()
+    published_at = serializers.SerializerMethodField()
 
     def get_latest_version(self, obj) -> dict | None:
         version = getattr(obj, "latest_version_obj", None)
@@ -958,9 +967,26 @@ class ScheduleDetailSerializer(ScheduleSummarySerializer):
             return None
         return ScheduleVersionSummarySerializer(version).data
 
+    def get_published_version(self, obj) -> int | None:
+        return obj.published_version_id
+
+    def get_published_version_number(self, obj) -> int | None:
+        if obj.published_version_id is None:
+            return None
+        return obj.published_version.version_number
+
+    def get_published_at(self, obj) -> Any | None:
+        if obj.published_version_id is None:
+            return None
+        return obj.published_version.published_at
+
 
 class ScheduleVersionDetailSerializer(ScheduleVersionSummarySerializer):
-    """One version with its full generation provenance.
+    """One version with its full generation provenance and workflow metadata.
+
+    Workflow metadata is exposed here rather than on the summary shape, so the list
+    contract stays as it was while a detail response can show who submitted, reviewed,
+    approved and published this version, and when.
 
     Entries are not nested: they are served by the version's ``entries`` action.
     """
@@ -971,6 +997,19 @@ class ScheduleVersionDetailSerializer(ScheduleVersionSummarySerializer):
     solver_num_branches = serializers.IntegerField(allow_null=True, required=False)
     validation_summary = serializers.DictField(required=False)
     generation_summary = serializers.DictField(required=False)
+    submitted_by = ScheduleUserSummarySerializer(allow_null=True, required=False)
+    submitted_at = serializers.DateTimeField(allow_null=True, required=False)
+    reviewed_by = ScheduleUserSummarySerializer(allow_null=True, required=False)
+    reviewed_at = serializers.DateTimeField(allow_null=True, required=False)
+    approved_by = ScheduleUserSummarySerializer(allow_null=True, required=False)
+    approved_at = serializers.DateTimeField(allow_null=True, required=False)
+    published_by = ScheduleUserSummarySerializer(allow_null=True, required=False)
+    published_at = serializers.DateTimeField(allow_null=True, required=False)
+    is_published_current = serializers.SerializerMethodField()
+
+    def get_is_published_current(self, obj) -> bool:
+        """True when this version is the schedule's authoritative publication."""
+        return obj.schedule.published_version_id == obj.pk
 
 
 class ScheduleEntryTimeSlotSerializer(serializers.Serializer):
@@ -1285,3 +1324,118 @@ class ManualEditRejectedSerializer(serializers.Serializer):
     validation = ManualEditValidationResponseSerializer(
         allow_null=True, required=False
     )
+
+
+# --- Phase 13: workflow and publication ------------------------------------
+
+
+class ScheduleWorkflowActionSerializer(StrictFieldValidationMixin, serializers.Serializer):
+    """Request body of every workflow action, which is empty on purpose.
+
+    A transition is an explicit server-side operation with no client-controlled
+    parameters: the stage comes from the URL, the actor from the session, and the
+    timestamp from the server. Fields such as ``status``, ``published_version`` or a
+    workflow actor are therefore unsupported and rejected rather than ignored.
+    """
+
+
+class WorkflowIssueSerializer(serializers.Serializer):
+    """One blocking reason a stored version cannot advance."""
+
+    code = serializers.CharField(
+        help_text="Stable issue code; the full list is documented in the README."
+    )
+    severity = serializers.CharField(help_text="Always ERROR: workflow issues block.")
+    message = serializers.CharField()
+    entry_id = serializers.IntegerField(allow_null=True, required=False)
+    conflicting_entry_id = serializers.IntegerField(allow_null=True, required=False)
+    details = serializers.DictField(required=False)
+
+
+class WorkflowValidationResponseSerializer(serializers.Serializer):
+    """Report of one full-version validation run.
+
+    ``valid`` is true only when nothing blocks progression. The stored timetable is
+    measured against today's configuration, so a version that was valid when created
+    can be reported stale here.
+    """
+
+    valid = serializers.SerializerMethodField()
+    version = serializers.IntegerField(source="version_id")
+    status = serializers.ChoiceField(choices=ScheduleStatus.choices)
+    summary = serializers.SerializerMethodField()
+    issues = WorkflowIssueSerializer(many=True)
+
+    def get_valid(self, obj) -> bool:
+        return obj.valid
+
+    def get_summary(self, obj) -> dict:
+        return obj.as_summary()
+
+
+class WorkflowTransitionResponseSerializer(serializers.Serializer):
+    """Response body of an applied workflow action.
+
+    ``version`` is the full version detail, so the new status and all workflow
+    metadata are visible in one response. ``applied`` is always true here; a refused
+    action answers ``409`` with the rejected shape instead.
+    """
+
+    applied = serializers.BooleanField()
+    action = serializers.CharField()
+    status = serializers.ChoiceField(choices=ScheduleStatus.choices)
+    from_status = serializers.ChoiceField(
+        choices=ScheduleStatus.choices, allow_null=True, required=False
+    )
+    version = ScheduleVersionDetailSerializer()
+    validation = WorkflowValidationResponseSerializer(
+        allow_null=True, required=False
+    )
+
+
+class WorkflowRejectedSerializer(serializers.Serializer):
+    """Response body of a refused workflow action.
+
+    ``reason`` is one of ``INVALID_TRANSITION``, ``STALE_VERSION``,
+    ``DEPARTMENT_SCHEDULE_NOT_PUBLISHABLE``, ``EMPTY_SCHEDULE_CANNOT_BE_PUBLISHED``
+    or ``SCHEDULE_VALIDATION_FAILED``. Nothing was changed: the status, the workflow
+    metadata and every entry stay exactly as they were.
+    """
+
+    applied = serializers.BooleanField()
+    action = serializers.CharField()
+    reason = serializers.CharField()
+    message = serializers.CharField(allow_blank=True, required=False)
+    status = serializers.ChoiceField(
+        choices=ScheduleStatus.choices, allow_null=True, required=False
+    )
+    version = serializers.IntegerField(
+        source="version.id", allow_null=True, required=False
+    )
+    validation = WorkflowValidationResponseSerializer(
+        allow_null=True, required=False
+    )
+
+
+class PublishedVersionIdentitySerializer(serializers.Serializer):
+    """Identity of the authoritative published version."""
+
+    id = serializers.IntegerField()
+    version_number = serializers.IntegerField()
+    status = serializers.ChoiceField(choices=ScheduleStatus.choices)
+    published_at = serializers.DateTimeField(allow_null=True, required=False)
+    published_by = ScheduleUserSummarySerializer(allow_null=True, required=False)
+
+
+class PublishedScheduleResponseSerializer(serializers.Serializer):
+    """Response body of ``GET /api/published-schedules/current/``.
+
+    Entries are rendered from the version's own snapshot columns, so the official
+    timetable keeps the names and times that were approved even after the live course,
+    room, department, instructor or group records are renamed.
+    """
+
+    semester = SemesterSummarySerializer()
+    schedule = ScheduleIdentitySerializer()
+    version = PublishedVersionIdentitySerializer()
+    entries = ScheduleEntrySerializer(many=True)

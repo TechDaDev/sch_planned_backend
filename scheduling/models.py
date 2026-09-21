@@ -6,6 +6,9 @@ periods, breaks) and the dates that are not schedulable. Phase 11 adds the
 persisted timetable: ``Schedule`` is the logical timetable of one semester and
 scope, ``ScheduleVersion`` is one immutable generated snapshot of it, and
 ``ScheduleEntry`` plus its three child tables record the sessions that were placed.
+Phase 13 adds the workflow around those snapshots - stage metadata on the version and
+the authoritative publication pointer on the schedule. Neither ever rewrites a
+stored timetable.
 
 ``academics.Weekday`` (Sunday → Thursday) is reused; Friday and Saturday are not
 ordinary working days in this version.
@@ -562,6 +565,17 @@ class Schedule(models.Model):
         blank=True,
         related_name="schedules",
     )
+    published_version = models.ForeignKey(
+        "ScheduleVersion",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="published_for_schedules",
+        help_text=(
+            "The currently authoritative published version of this schedule. "
+            "Only a college schedule may point at one."
+        ),
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -597,12 +611,27 @@ class Schedule(models.Model):
         ]
 
     def clean(self):
-        """Keep scope and department consistent before the database sees it."""
+        """Keep scope and department consistent before the database sees it.
+
+        The same check keeps the publication pointer honest: it must name a version of
+        *this* schedule, and only a college schedule may have one at all. A cross-table
+        rule cannot be a database constraint, so the model and the workflow service
+        both enforce it.
+        """
         errors = {}
         if self.scope == ScheduleScope.DEPARTMENT and self.department_id is None:
             errors["department"] = "A department schedule must name its department."
         if self.scope == ScheduleScope.COLLEGE and self.department_id is not None:
             errors["department"] = "A college schedule must not name a department."
+        if self.published_version_id is not None:
+            if self.scope != ScheduleScope.COLLEGE:
+                errors["published_version"] = (
+                    "Only a college schedule may publish an official timetable."
+                )
+            elif self.published_version.schedule_id != self.pk:
+                errors["published_version"] = (
+                    "The published version belongs to another schedule."
+                )
         if errors:
             raise ValidationError(errors)
 
@@ -672,6 +701,42 @@ class ScheduleVersion(models.Model):
 
     validation_summary = models.JSONField(default=dict, blank=True)
     generation_summary = models.JSONField(default=dict, blank=True)
+
+    # Workflow metadata. Each stage stamps its own pair and never rewrites an earlier
+    # one, so a SUBMITTED version keeps naming who submitted it after it is approved.
+    # Clients cannot supply these fields: only the workflow endpoints set them.
+    submitted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="submitted_schedule_versions",
+    )
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    reviewed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="reviewed_schedule_versions",
+    )
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="approved_schedule_versions",
+    )
+    approved_at = models.DateTimeField(null=True, blank=True)
+    published_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="published_schedule_versions",
+    )
+    published_at = models.DateTimeField(null=True, blank=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
 
