@@ -8,11 +8,13 @@ Calendar exceptions are scoped, so both writes and reads depend on the scope:
 * writes need a college administrator, or a department administrator whose
   department owns the targeted resource (``CalendarException.owning_department_id``
   is the single source for that mapping);
-* reads give every authenticated user the college-wide and own-department
-  exceptions, plus instructor exceptions shared under the Phase 4 instructor
-  sharing rules, room exceptions shared under the Phase 5 room rules, and
-  student-group exceptions for groups of the user's own department. Joint-course
-  participation alone does not expose unrelated private absence/closure records.
+* reads give every authenticated user the college-wide exceptions, plus the
+  own-department exceptions, instructor exceptions shared under the Phase 4
+  instructor sharing rules, room exceptions shared under the Phase 5 room rules,
+  and student-group exceptions for groups of the user's own department. Joint
+  course participation alone does not expose unrelated private
+  absence/closure records, and a user without a department sees the college-wide
+  exceptions and nothing else.
 """
 
 from django.db import models
@@ -24,10 +26,15 @@ from scheduling.models import ExceptionScope
 
 
 def visible_calendar_exceptions_filter(user) -> models.Q:
-    """Calendar exceptions a department-scoped user may read."""
+    """Calendar exceptions a user may read.
+
+    College-wide exceptions affect everybody, so they stay readable to any
+    authenticated user - including one without a department. Every other scope
+    needs a department to resolve through.
+    """
     department = user.department
     if department is None:
-        return models.Q(pk__in=[])
+        return models.Q(scope_type=ExceptionScope.COLLEGE)
     department_id = department.pk
     return (
         models.Q(scope_type=ExceptionScope.COLLEGE)

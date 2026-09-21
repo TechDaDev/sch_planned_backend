@@ -590,11 +590,11 @@ College-wide and own-department exceptions are visible to a department, along
 with instructor exceptions for instructors shared with it, room exceptions for
 rooms it may use, and group exceptions for its own groups. A joint course alone
 does not expose another department's absence or closure records, and a user
-without a department sees no exceptions at all. Writes need a college
-administrator, or a department administrator acting on a resource its own
-department owns — a department administrator cannot create a college-wide
-exception, and cannot move an owned exception onto a foreign instructor, room or
-group.
+without a department still reads the college-wide exceptions — those affect
+everybody — but nothing else. Writes need a college administrator, or a
+department administrator acting on a resource its own department owns — a
+department administrator cannot create a college-wide exception, and cannot move
+an owned exception onto a foreign instructor, room or group.
 
 ### The grid is configuration, not assignment
 

@@ -83,6 +83,9 @@ class CalendarExceptionViewSet(
 
     Reads are scoped by the exception's scope; writes require a college
     administrator or the department that owns the targeted resource.
+    College-wide exceptions concern everybody, so a caller without a department
+    still reads them (hence ``visibility_requires_department = False``) while the
+    scope filter keeps every other scope out of reach.
     """
 
     queryset = CalendarException.objects.select_related(
@@ -96,6 +99,7 @@ class CalendarExceptionViewSet(
     read_serializer_class = CalendarExceptionSerializer
     write_serializer_class = CalendarExceptionWriteSerializer
     permission_classes = [IsAuthenticated, CanManageCalendarExceptions]
+    visibility_requires_department = False
     filter_fields = (
         "semester",
         "date",

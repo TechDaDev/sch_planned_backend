@@ -222,7 +222,16 @@ class DepartmentVisibilityQuerysetMixin:
     Phase 2 resources are scoped by an exact department match. Phase 3 records
     can also be visible to a second department whose students attend a joint
     component, so each viewset supplies its own ``visibility_filter``.
+
+    A caller without a department normally sees nothing (fail closed). Viewsets
+    whose records include genuinely college-wide rows that every authenticated
+    user may read - calendar exceptions, for instance - set
+    ``visibility_requires_department = False`` and let ``visibility_filter`` draw
+    the line instead.
     """
+
+    #: When True, a user without a department sees nothing at all.
+    visibility_requires_department = True
 
     def visibility_filter(self, user):
         """Return the ``Q`` object describing the records visible to ``user``."""
@@ -235,7 +244,7 @@ class DepartmentVisibilityQuerysetMixin:
             return queryset.none()
         if user.has_cross_department_access:
             return queryset
-        if user.department_id is None:
+        if user.department_id is None and self.visibility_requires_department:
             return queryset.none()
         return queryset.filter(self.visibility_filter(user)).distinct()
 
