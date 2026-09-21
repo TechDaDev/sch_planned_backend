@@ -32,7 +32,11 @@ from academics.models import (
     TeachingComponentGroup,
     Weekday,
 )
-from resources.models import AssignmentRole, TeachingAssignment
+from resources.models import (
+    AssignmentRole,
+    TeachingAssignment,
+    TeachingComponentCapabilityRequirement,
+)
 from scheduling.services.validation.issues import (
     EntityType,
     IssueCode,
@@ -159,7 +163,12 @@ class PreSchedulingValidator:
                     .select_related("instructor", "instructor__primary_department")
                     .order_by("assignment_role", "instructor_id"),
                 ),
-                "room_requirement__capability_requirements",
+                Prefetch(
+                    "room_requirement__capability_requirements",
+                    queryset=TeachingComponentCapabilityRequirement.objects.select_related(
+                        "capability"
+                    ).order_by("capability_id"),
+                ),
             )
             .order_by("pk")
         )
