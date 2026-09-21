@@ -169,7 +169,9 @@ def test_exception_visibility_scopes_and_departmentless_fail_closed(api_client, 
 
     departmentless = create_user(UserRole.SCHEDULER)
     authenticate(api_client, departmentless)
-    assert api_client.get(EXCEPTIONS_URL).json() == []
+    assert response_ids(api_client.get(EXCEPTIONS_URL)) == {
+        graph["exceptions"]["college"].id,
+    }
 
 
 @pytest.mark.django_db
