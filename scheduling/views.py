@@ -9,8 +9,11 @@ Nothing here assigns resources to slots — that arrives with schedule entries i
 later phase.
 """
 
-from drf_spectacular.utils import extend_schema
+from drf_spectacular.utils import OpenApiResponse, extend_schema
+from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.views import APIView
 
 from academics.permissions import IsCollegeAdminOrReadOnly
 from academics.views import AcademicStructureViewSet, DepartmentVisibilityQuerysetMixin
@@ -18,6 +21,8 @@ from resources.views import QueryParameterFilterMixin
 from scheduling.models import BreakPeriod, CalendarException, TimeSlot, WorkingDay
 from scheduling.permissions import (
     CanManageCalendarExceptions,
+    CanRunPreSchedulingValidation,
+    resolve_validation_scope,
     visible_calendar_exceptions_filter,
 )
 from scheduling.serializers import (
@@ -25,13 +30,17 @@ from scheduling.serializers import (
     BreakPeriodWriteSerializer,
     CalendarExceptionSerializer,
     CalendarExceptionWriteSerializer,
+    PreSchedulingValidationInputSerializer,
+    PreSchedulingValidationResponseSerializer,
     TimeSlotSerializer,
     TimeSlotWriteSerializer,
     WorkingDaySerializer,
     WorkingDayWriteSerializer,
 )
+from scheduling.services.validation import PreSchedulingValidator
 
 CALENDAR_TAGS = ["calendar"]
+SCHEDULING_TAGS = ["scheduling"]
 
 
 @extend_schema(tags=CALENDAR_TAGS)
@@ -114,3 +123,71 @@ class CalendarExceptionViewSet(
 
     def visibility_filter(self, user):
         return visible_calendar_exceptions_filter(user)
+
+
+@extend_schema(tags=SCHEDULING_TAGS)
+class PreSchedulingValidationView(APIView):
+    """Report whether the stored data is ready for timetable generation.
+
+    The view only validates the request body, authorizes the requested scope,
+    calls the validation service and serializes the result; all the checking lives
+    in ``scheduling.services.validation``. The endpoint is read-only: it computes
+    its answer and never changes scheduling or academic data.
+
+    Scope rules: a college administrator (or superuser) may validate the whole
+    college or any single department, a department administrator or scheduler only
+    its own department and never the whole college, and ``VIEWER``/``INSTRUCTOR``
+    may not run validation at all. A department-scoped user without a department
+    fails closed.
+    """
+
+    permission_classes = [IsAuthenticated, CanRunPreSchedulingValidation]
+
+    @extend_schema(
+        summary="Validate scheduling readiness for a semester",
+        description=(
+            "Runs the deterministic pre-scheduling checks for one semester and "
+            "scope and returns the issues that would block timetable generation. "
+            "``ready`` is true only when no ERROR was found; WARNING issues never "
+            "block generation. Nothing is written.\n\n"
+            "The validator is a set of necessary feasibility conditions, not a "
+            "solver: it does not place sessions, assign rooms, avoid collisions, "
+            "optimise preferences or subtract calendar exceptions from recurring "
+            "weekly capacity."
+        ),
+        request=PreSchedulingValidationInputSerializer,
+        responses={
+            200: PreSchedulingValidationResponseSerializer,
+            400: OpenApiResponse(
+                description=(
+                    "Malformed body, unknown semester/department id, or a "
+                    "department outside the caller's scope."
+                )
+            ),
+            401: OpenApiResponse(description="Authentication required."),
+            403: OpenApiResponse(
+                description=(
+                    "The caller's role may not run validation, or a "
+                    "department-scoped caller has no department."
+                )
+            ),
+        },
+    )
+    def post(self, request):
+        serializer = PreSchedulingValidationInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        department = resolve_validation_scope(
+            request.user,
+            scope=data["scope"],
+            department=data.get("department"),
+        )
+        result = PreSchedulingValidator(
+            semester=data["semester"],
+            scope=data["scope"],
+            department=department,
+        ).run()
+        return Response(
+            PreSchedulingValidationResponseSerializer(result).data,
+            status=status.HTTP_200_OK,
+        )

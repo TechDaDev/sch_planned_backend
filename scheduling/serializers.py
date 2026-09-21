@@ -34,6 +34,7 @@ from scheduling.models import (
     TimeSlot,
     WorkingDay,
 )
+from scheduling.services.validation import Severity, ValidationScope
 
 
 class WorkingDaySummarySerializer(serializers.ModelSerializer):
@@ -305,3 +306,110 @@ class CalendarExceptionWriteSerializer(
             )
 
         return attrs
+
+
+# --- Phase 7: pre-scheduling validation ------------------------------------
+
+
+class PreSchedulingValidationInputSerializer(serializers.Serializer):
+    """Request body of ``POST /api/scheduling/validate/``.
+
+    ``COLLEGE`` and ``DEPARTMENT`` are the only scopes, and the two shapes never
+    overlap: a college-wide run must omit ``department``, a department run must
+    supply exactly one. Ambiguous input is rejected before the validator runs.
+
+    Named for its *input* role on purpose: the project enables
+    ``COMPONENT_SPLIT_REQUEST``, so the generated component is
+    ``PreSchedulingValidationInputRequest`` and a class already ending in
+    ``Request`` would produce a doubled name.
+    """
+
+    semester = serializers.PrimaryKeyRelatedField(queryset=Semester.objects.all())
+    scope = serializers.ChoiceField(choices=ValidationScope.choices)
+    department = serializers.PrimaryKeyRelatedField(
+        queryset=Department.objects.all(),
+        required=False,
+        allow_null=True,
+    )
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        scope = attrs.get("scope")
+        department = attrs.get("department")
+        if scope == ValidationScope.COLLEGE and department is not None:
+            raise serializers.ValidationError(
+                {"department": "Omit department when scope is COLLEGE."}
+            )
+        if scope == ValidationScope.DEPARTMENT and department is None:
+            raise serializers.ValidationError(
+                {"department": "This field is required when scope is DEPARTMENT."}
+            )
+        return attrs
+
+
+class ValidationSemesterSerializer(serializers.Serializer):
+    """Semester identification block of a validation response.
+
+    ``academic_year`` is the human-readable label (``"2026-2027"``) that
+    administrators recognise, while ``academic_year_id`` keeps the primary key for
+    clients that need to link back to the record.
+    """
+
+    id = serializers.IntegerField()
+    number = serializers.IntegerField()
+    academic_year = serializers.SerializerMethodField()
+    academic_year_id = serializers.SerializerMethodField()
+
+    @extend_schema_field(serializers.CharField())
+    def get_academic_year(self, obj):
+        """Display label of the academic year, for example ``2026-2027``."""
+        return str(obj.academic_year)
+
+    @extend_schema_field(serializers.IntegerField())
+    def get_academic_year_id(self, obj):
+        """Primary key of the semester's academic year."""
+        return obj.academic_year_id
+
+
+class ValidationSummarySerializer(serializers.Serializer):
+    """Counts block of a validation response."""
+
+    components_checked = serializers.IntegerField()
+    errors = serializers.IntegerField()
+    warnings = serializers.IntegerField()
+
+
+class ValidationIssueSerializer(serializers.Serializer):
+    """One validation issue.
+
+    ``code`` values are stable and finite; ``details`` carries scalars that
+    describe the finding for that specific code. Messages are written for humans
+    and never echo a Python exception.
+    """
+
+    code = serializers.CharField(
+        help_text="Stable issue code; the full list is documented in the README."
+    )
+    severity = serializers.ChoiceField(choices=Severity.choices)
+    message = serializers.CharField()
+    entity_type = serializers.CharField(
+        help_text="Model name of the row the issue is reported against."
+    )
+    entity_id = serializers.IntegerField(allow_null=True, required=False)
+    details = serializers.DictField(required=False)
+
+
+class PreSchedulingValidationResponseSerializer(serializers.Serializer):
+    """Response body of ``POST /api/scheduling/validate/``.
+
+    ``ready`` is true only when no issue has ``severity = "ERROR"``; warnings
+    never block timetable generation. ``department`` is ``null`` for a
+    college-wide run.
+    """
+
+    ready = serializers.BooleanField()
+    scope = serializers.ChoiceField(choices=ValidationScope.choices)
+    semester = ValidationSemesterSerializer()
+    department = DepartmentSummarySerializer(allow_null=True, required=False)
+    summary = ValidationSummarySerializer()
+    issues = ValidationIssueSerializer(many=True)

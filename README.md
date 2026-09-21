@@ -4,10 +4,10 @@ Django REST Framework backend for the College Academic Schedule Planner.
 Provides the project foundation (configuration package, domain app skeletons,
 custom user model, API/OpenAPI plumbing) that later phases build on.
 
-- Current phase: **Phase 6 — calendar and time configuration** (working days,
-  teaching periods, breaks and calendar exceptions). No timetable generation,
-  schedule entries or actual room/time assignment yet; pre-scheduling validation
-  is Phase 7.
+- Current phase: **Phase 7 — pre-scheduling validation** (a computed readiness
+  report over the academic, resource and calendar data). Timetable generation,
+  OR-Tools, schedule entries and actual room/time assignment are **not**
+  implemented yet; they are Phase 8.
 
 ## Architecture
 
@@ -49,13 +49,15 @@ sch_planner_backend/
 │   ├── views.py       # viewsets + /api/me/teaching-assignments/
 │   ├── urls.py        # /api/instructors/, /api/rooms/, ...
 │   └── migrations/    # 0001_initial, 0002_rooms_and_requirements
-├── scheduling/        # calendar and time configuration
+├── scheduling/        # calendar, time configuration and validation
 │   ├── models.py      # WorkingDay, TimeSlot, BreakPeriod, CalendarException,
 │   │                  # ExceptionType, ExceptionScope
-│   ├── permissions.py # calendar-exception read visibility and write rules
-│   ├── serializers.py # read/write serializers + nested summaries
-│   ├── views.py       # viewsets for the time grid and exceptions
-│   ├── urls.py        # /api/working-days/, /api/time-slots/, ...
+│   ├── services/      # domain logic kept out of the views
+│   │   └── validation/# issues, time_grid, resources, validator
+│   ├── permissions.py # calendar visibility and validation scope rules
+│   ├── serializers.py # read/write serializers + validation contract
+│   ├── views.py       # time-grid viewsets + the validation endpoint
+│   ├── urls.py        # /api/working-days/, /api/scheduling/validate/, ...
 │   └── migrations/    # 0001_calendar_and_time_configuration
 ├── reports/           # report exports (empty until later phases)
 ├── tests/             # pytest suite for the whole project
@@ -72,9 +74,11 @@ capabilities, weekly availability and the room requirements that teaching
 components declare. Phase 6 adds the college time configuration the scheduler
 will search: which weekdays each semester teaches, the teaching periods and
 breaks inside those days, and the dated exceptions (holidays, exams, closures,
-absences) that remove availability. Timetable generation (OR-Tools), schedule
-entries, actual room and time assignment, pre-scheduling validation and reports
-come later. The Flutter instructor app follows the web application.
+absences) that remove availability. Phase 7 adds a computed pre-scheduling
+validator that reports whether the stored data is ready for timetable
+generation. Timetable generation (OR-Tools), schedule entries, actual room and
+time assignment and reports come later; none of them exist yet. The Flutter
+instructor app follows the web application.
 
 ## Requirements
 
@@ -169,6 +173,7 @@ All resource APIs expose the same five operations — `GET` list, `GET` detail,
 | Time slots                | `/api/time-slots/`                 | college-wide (writes: college admin)   |
 | Break periods             | `/api/break-periods/`              | college-wide (writes: college admin)   |
 | Calendar exceptions       | `/api/calendar-exceptions/`        | scope-dependent (see the calendar section) |
+| Scheduling validation     | `POST /api/scheduling/validate/`   | see the validation section below       |
 
 Write ownership in this table is stricter than read visibility for shared
 resources: shared instructors and rooms are readable by the departments they are
@@ -604,13 +609,204 @@ instructor, room or student group to a slot, and no double-booking is prevented
 — that belongs to schedule entries and the pre-scheduling validator in later
 phases.
 
+## Pre-scheduling validation
+
+Timetable generation is expensive and its failures are opaque, so the backend can
+report — before any solver runs — what would make generation fail. The validator
+reads the data already stored in the backend and returns a computed report.
+
+```
+POST /api/scheduling/validate/
+```
+
+```json
+{ "semester": 3, "scope": "DEPARTMENT", "department": 2 }
+```
+
+```json
+{ "semester": 3, "scope": "COLLEGE" }
+```
+
+`scope` is either `COLLEGE` or `DEPARTMENT`, and the two shapes never overlap: a
+college-wide run must omit `department`, a department run must supply exactly
+one. Ambiguous or malformed input is rejected with `400`, an unknown semester or
+department id with `400`, a caller whose role may not run validation (or a
+department-scoped caller without a department) with `403`, and an existing
+department outside the caller's scope with `400` — the same convention earlier
+phases use for out-of-scope payload references. Nothing about another
+department's data is revealed either way.
+
+**Nothing is written.** The endpoint is read/compute only: no saves, no temporary
+records, no automatic corrections, and no database table for results.
+
+### Who may validate
+
+| Caller | May validate |
+| --- | --- |
+| `COLLEGE_ADMIN`, Django superuser | the whole college, or any single department |
+| `DEPARTMENT_ADMIN`, `SCHEDULER` | its own department only — never the whole college, and never another department by submitting its id |
+| `VIEWER`, `INSTRUCTOR` | nothing (`403`) |
+| department-scoped user with no department | nothing (`403`, fail closed) |
+
+### Response contract
+
+```json
+{
+  "ready": false,
+  "scope": "DEPARTMENT",
+  "semester": { "id": 3, "number": 1, "academic_year": "2026-2027", "academic_year_id": 2 },
+  "department": { "id": 2, "name": "Biomedical Applications", "code": "BIOAI" },
+  "summary": { "components_checked": 18, "errors": 4, "warnings": 2 },
+  "issues": [
+    {
+      "code": "PRIMARY_INSTRUCTOR_MISSING",
+      "severity": "ERROR",
+      "message": "This teaching component has no active primary instructor.",
+      "entity_type": "TeachingComponent",
+      "entity_id": 15,
+      "details": { "course_code": "BIO201", "component_type": "THEORY" }
+    }
+  ]
+}
+```
+
+`ready` is **true only when there are zero `ERROR` issues**; warnings never make a
+run un-ready. `department` is `null` for a college-wide run. `components_checked`
+counts the teaching components treated as timetable demand, so a component whose
+offering, course or managing department is switched off is reported but not
+counted.
+
+`entity_type` is the model name of the row the issue is reported against, and
+`entity_id` its primary key. Messages are written for humans and never echo a
+Python exception. `details` carries scalars specific to the code.
+
+### What it checks
+
+**Scope population.** `DEPARTMENT` validates the active components of active
+offerings for the requested semester whose managing department is the requested
+department; `COLLEGE` validates every active component of the semester. Other
+semesters are ignored, and inactive components are never treated as demand.
+Components may legitimately serve groups of other departments (joint teaching).
+
+**The time grid** — the recurring weekly grid only:
+
+- `NO_ACTIVE_WORKING_DAYS` when the semester has no active working day;
+- `WORKING_DAY_NO_ACTIVE_SLOTS` for each active working day with no active slot.
+
+**Component demand** — which sessions have to be placed and how big they are:
+
+- `COMPONENT_NO_STUDENT_GROUPS`, `STUDENT_GROUP_INACTIVE`, `STUDENT_COUNT_ZERO`;
+- `SESSION_DURATION_NOT_SUPPORTED_BY_GRID` when the session duration fits no
+  contiguous block of active slots on any active working day;
+- `COMPONENT_WEEKLY_HOURS_EXCEED_GRID` when one component's weekly minutes exceed
+  the entire configured weekly grid;
+- `INACTIVE_ACADEMIC_DEPENDENCY` when a component's offering, course or managing
+  department is inactive, or when a participating group sits in an inactive
+  study stage, program or department.
+
+**Instructors** — presence, current eligibility and necessary workload ceilings:
+
+- `PRIMARY_INSTRUCTOR_MISSING` / `MULTIPLE_PRIMARY_INSTRUCTORS` (the validator
+  does not trust the database constraint alone and fails safely on inconsistent
+  data);
+- `INSTRUCTOR_INACTIVE` and `INSTRUCTOR_NOT_ELIGIBLE` — eligibility is
+  re-derived through `InstructorProfile.can_teach_in_department`, because sharing
+  scope and access grants may have changed since the assignment was created;
+- `INSTRUCTOR_AVAILABILITY_MISSING` — absence of availability rows is never read
+  as 24/7 availability;
+- `INSTRUCTOR_SESSION_DURATION_UNSUPPORTED` when no contiguous block the
+  instructor is available for is long enough for the session;
+- `INSTRUCTOR_AVAILABLE_TIME_INSUFFICIENT` when assigned weekly minutes exceed the
+  weekly minutes the instructor's availability actually covers;
+- `INSTRUCTOR_MAX_WEEKLY_HOURS_EXCEEDED`;
+- `INSTRUCTOR_MAX_DAILY_HOURS_IMPOSSIBLE` — either a single session is longer than
+  the daily limit, or the necessary weekly ceiling `usable_days × max_daily_hours`
+  is below the assigned weekly hours.
+
+**Rooms** — requirements, current candidates and available blocks:
+
+- `ROOM_REQUIREMENT_MISSING` / `ROOM_REQUIREMENT_INACTIVE`;
+- `ROOM_TYPE_INACTIVE` / `ROOM_CAPABILITY_INACTIVE`;
+- `NO_SUITABLE_ROOM` when no active room satisfies the requirement;
+- `NO_SUITABLE_ROOM_WITH_AVAILABILITY` when suitable rooms exist but none has both
+  a long enough contiguous block for one session and enough usable weekly minutes
+  for the component's whole weekly demand.
+
+Room suitability is not re-implemented: `Room.meets_requirement` (the canonical
+Phase 5 helper) decides ownership/sharing, room type, effective capacity and the
+"all required capabilities" rule, and its verdict is memoised per
+`(room, requirement shape)` so a college-wide run does not pay for the same pair
+twice.
+
+### Warnings
+
+Only two codes are warnings, and they never block:
+
+- `INSTRUCTOR_MAX_WEEKLY_HOURS_NOT_CONFIGURED`;
+- `INSTRUCTOR_MAX_DAILY_HOURS_NOT_CONFIGURED`.
+
+`InstructorPreference` is deliberately **not** consulted: preferences are soft, so
+an unsatisfiable preference is never an error and Phase 7 does not optimise for
+them.
+
+### Ordering and deduplication
+
+Issues are sorted deterministically by severity (errors first), then `code`,
+`entity_type`, `entity_id` and the canonical rendering of `details`, so identical
+data always yields an identical response. Exact duplicates are collapsed, and
+resource-scoped findings are reported per resource: an instructor assigned to
+three components with no availability produces **one**
+`INSTRUCTOR_AVAILABILITY_MISSING` for that instructor, while a component-specific
+duration problem stays per component.
+
+Contiguous-session arithmetic is pure and exact: hours are converted with
+`Decimal` (never binary floating point), and adjacent slots merge into one block
+(`08:00-08:45` + `08:45-09:30` supports 90 minutes) while slots separated by a gap
+do not (`08:00-08:45` + `09:00-09:45` does not).
+
+### What it deliberately does not check
+
+These are necessary feasibility conditions, **not a solver**:
+
+- no session placement, no schedule generation, no room or time assignment;
+- no collision avoidance between components, groups or rooms (two components may
+  each pass while still competing for the same slot);
+- no optimisation of instructor preferences or daily distribution — the daily
+  limit is only used as a necessary ceiling;
+- **calendar exceptions are not subtracted from recurring weekly capacity.** A
+  holiday does not invalidate the weekly grid, and date-by-date capacity belongs
+  to later calendar-aware schedule application and publication, not to this
+  validator;
+- **no OR-Tools.** Phase 7 installs and imports no solver; `ortools` is
+  deliberately absent from `requirements.txt`.
+
+### Architecture
+
+The view validates its input, authorizes the scope, calls the service and
+serializes the result — it contains no checking logic:
+
+```
+scheduling/services/validation/
+├── issues.py     # severities, stable codes, issue shape, dedup + ordering
+├── time_grid.py  # duration conversion, contiguous blocks, grid capacity
+├── resources.py  # instructor availability/eligibility, room candidates
+└── validator.py  # scope population and the per-domain checks
+```
+
+The validator loads its inputs with `select_related`/`prefetch_related` (grid,
+offerings, groups and their hierarchy, assignments and instructors, room
+requirements and capabilities, rooms with capabilities and grants, availability
+rows) and then works in memory, memoising the canonical helper calls that would
+otherwise repeat per component.
+
 ## Who may write what
 
 | Role | Reads | Writes |
 | --- | --- | --- |
-| `COLLEGE_ADMIN` or Django superuser | everything | everything: colleges, academic years, semesters, joint-course group associations, instructor profiles, sharing grants, availability, preferences, assignments, room types, room capabilities, rooms, room grants, room capabilities and availability, teaching-component room requirements, working days, time slots, breaks and calendar exceptions |
-| `DEPARTMENT_ADMIN` | own department plus joint components their students attend, instructors shared with them, rooms they may use, and calendar exceptions in their scope | own department: update it; manage programs, stages, groups, courses, offerings, components, component/group links (own groups only), instructor profiles, sharing grants, availability, preferences, assignments on components their department manages, own rooms with their grants, capabilities and availability, room requirements for components their department manages, and calendar exceptions for own-department resources |
-| `SCHEDULER`, `VIEWER`, `INSTRUCTOR` | own department plus joint components their students attend, instructors shared with them, rooms they may use, and the calendar grid and exceptions in their scope | none — every Phase 2–6 resource is read-only for these roles |
+| `COLLEGE_ADMIN` or Django superuser | everything | everything: colleges, academic years, semesters, joint-course group associations, instructor profiles, sharing grants, availability, preferences, assignments, room types, room capabilities, rooms, room grants, room capabilities and availability, teaching-component room requirements, working days, time slots, breaks and calendar exceptions; may run validation for the whole college or any department |
+| `DEPARTMENT_ADMIN` | own department plus joint components their students attend, instructors shared with them, rooms they may use, and calendar exceptions in their scope | own department: update it; manage programs, stages, groups, courses, offerings, components, component/group links (own groups only), instructor profiles, sharing grants, availability, preferences, assignments on components their department manages, own rooms with their grants, capabilities and availability, room requirements for components their department manages, and calendar exceptions for own-department resources; may run validation for **its own department only** |
+| `SCHEDULER` | own department plus joint components their students attend, instructors shared with them, rooms they may use, and the calendar grid and exceptions in their scope | none — every Phase 2–6 resource is read-only for this role, but it may run validation for **its own department only** |
+| `VIEWER`, `INSTRUCTOR` | own department plus joint components their students attend, instructors shared with them, rooms they may use, and the calendar grid and exceptions in their scope | none — every Phase 2–6 resource is read-only for these roles, and they may **not** run validation |
 
 A department can never modify a shared instructor or room, inspect availability
 that is not shared with it, grant itself access to a foreign instructor or room,
@@ -678,9 +874,10 @@ not used.
   availability, and the room/capability requirements teaching components declare.
 - **Phase 6 (done)** — calendar and time configuration: working days, teaching
   periods, breaks and dated calendar exceptions.
-- **Phase 7 (planned)** — pre-scheduling validation.
-- **Later** — timetable generation (OR-Tools), schedule entries, actual room and
-  time assignment, reports/export, PostgreSQL, background jobs, Railway
-  deployment.
+- **Phase 7 (done)** — pre-scheduling validation: a computed readiness report
+  over the academic, resource and calendar data, with stable issue codes.
+- **Phase 8 (planned)** — timetable generation with OR-Tools: schedule entries
+  and actual room/time assignment, using the validator's checks as preconditions.
+- **Later** — reports/export, PostgreSQL, background jobs, Railway deployment.
 - **Flutter instructor app** — after the web application, using
   `/api/me/teaching-assignments/` as one of its first endpoints.

@@ -237,5 +237,12 @@ SPECTACULAR_SETTINGS = {
                 "dated calendar exceptions."
             ),
         },
+        {
+            "name": "scheduling",
+            "description": (
+                "Pre-scheduling validation: computed readiness checks that report "
+                "what would block timetable generation."
+            ),
+        },
     ],
 }
