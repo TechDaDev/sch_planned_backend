@@ -6,6 +6,7 @@ from rest_framework.routers import SimpleRouter
 from scheduling.views import (
     BreakPeriodViewSet,
     CalendarExceptionViewSet,
+    DepartmentScheduleGenerationView,
     PreSchedulingValidationView,
     TimeSlotViewSet,
     WorkingDayViewSet,
@@ -28,6 +29,13 @@ urlpatterns = [
         "scheduling/validate/",
         PreSchedulingValidationView.as_view(),
         name="pre-scheduling-validation",
+    ),
+    # Phase 9: generation returns a preview and persists nothing, so it is an
+    # action path too. Department scope only; college-wide comes with Phase 10.
+    path(
+        "scheduling/generate/",
+        DepartmentScheduleGenerationView.as_view(),
+        name="department-schedule-generation",
     ),
     *router.urls,
 ]

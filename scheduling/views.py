@@ -30,14 +30,18 @@ from scheduling.serializers import (
     BreakPeriodWriteSerializer,
     CalendarExceptionSerializer,
     CalendarExceptionWriteSerializer,
+    DepartmentGenerationResponseSerializer,
+    GenerationRejectedSerializer,
     PreSchedulingValidationInputSerializer,
     PreSchedulingValidationResponseSerializer,
+    ScheduleGenerationInputSerializer,
     TimeSlotSerializer,
     TimeSlotWriteSerializer,
     WorkingDaySerializer,
     WorkingDayWriteSerializer,
 )
-from scheduling.services.validation import PreSchedulingValidator
+from scheduling.services.generation import DepartmentScheduleGenerator
+from scheduling.services.validation import PreSchedulingValidator, ValidationScope
 
 CALENDAR_TAGS = ["calendar"]
 SCHEDULING_TAGS = ["scheduling"]
@@ -189,5 +193,83 @@ class PreSchedulingValidationView(APIView):
         ).run()
         return Response(
             PreSchedulingValidationResponseSerializer(result).data,
+            status=status.HTTP_200_OK,
+        )
+
+
+@extend_schema(tags=SCHEDULING_TAGS)
+class DepartmentScheduleGenerationView(APIView):
+    """Generate a preview timetable for one department and semester.
+
+    The view validates the request body, authorizes the department scope, calls the
+    generation service and serializes the outcome. All the work - the Phase 7 gate,
+    candidate building, the CP-SAT solve and the preview mapping - lives in
+    ``scheduling.services.generation``.
+
+    Nothing is persisted: no schedule model exists yet, and repeated requests
+    against unchanged data return the same preview.
+
+    Two outcomes are answered with ``409``: the Phase 7 gate refused the scope, or
+    no candidate could be built for some session. A completed run that simply found
+    no timetable is a ``200`` with ``generated: false``.
+    """
+
+    permission_classes = [IsAuthenticated, CanRunPreSchedulingValidation]
+
+    @extend_schema(
+        summary="Generate a department timetable preview",
+        description=(
+            "Builds the department's weekly scheduling problem from stored data, "
+            "solves it with CP-SAT and returns the resulting preview. "
+            "Department scope only: college-wide generation is a later phase.\n\n"
+            "The endpoint never writes: ``persisted`` is always false. Candidates "
+            "come from exact contiguous slot blocks that sum precisely to the "
+            "component's session length, from rooms the canonical Phase 5 rules "
+            "allow, and from blocks every assigned instructor and the room are "
+            "available for. Preference windows only influence the weighted "
+            "objective, never feasibility."
+        ),
+        request=ScheduleGenerationInputSerializer,
+        responses={
+            200: DepartmentGenerationResponseSerializer,
+            400: OpenApiResponse(
+                description=(
+                    "Malformed body, unknown semester or department id, a "
+                    "department outside the caller's scope, or a time limit outside "
+                    "the accepted range."
+                )
+            ),
+            401: OpenApiResponse(description="Authentication required."),
+            403: OpenApiResponse(
+                description=(
+                    "The caller's role may not generate schedules, or a "
+                    "department-scoped caller has no department."
+                )
+            ),
+            409: GenerationRejectedSerializer,
+        },
+    )
+    def post(self, request):
+        serializer = ScheduleGenerationInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        department = resolve_validation_scope(
+            request.user,
+            scope=ValidationScope.DEPARTMENT,
+            department=data["department"],
+        )
+        outcome = DepartmentScheduleGenerator(
+            semester=data["semester"],
+            department=department,
+            max_time_seconds=data["max_time_seconds"],
+        ).generate()
+
+        if outcome.rejected:
+            return Response(
+                GenerationRejectedSerializer(outcome).data,
+                status=status.HTTP_409_CONFLICT,
+            )
+        return Response(
+            DepartmentGenerationResponseSerializer(outcome).data,
             status=status.HTTP_200_OK,
         )

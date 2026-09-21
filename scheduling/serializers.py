@@ -34,7 +34,12 @@ from scheduling.models import (
     TimeSlot,
     WorkingDay,
 )
+from scheduling.services.solver import DEFAULT_MAX_TIME_SECONDS, SolverStatus
 from scheduling.services.validation import Severity, ValidationScope
+
+#: Bounds the API accepts for the solver time limit.
+MIN_GENERATION_TIME_SECONDS = 1
+MAX_GENERATION_TIME_SECONDS = 120
 
 
 class WorkingDaySummarySerializer(serializers.ModelSerializer):
@@ -413,3 +418,206 @@ class PreSchedulingValidationResponseSerializer(serializers.Serializer):
     department = DepartmentSummarySerializer(allow_null=True, required=False)
     summary = ValidationSummarySerializer()
     issues = ValidationIssueSerializer(many=True)
+
+
+# --- Phase 9: department schedule generation -------------------------------
+
+
+class ScheduleGenerationInputSerializer(serializers.Serializer):
+    """Request body of ``POST /api/scheduling/generate/``.
+
+    Only the department scope exists in this phase, so there is no ``scope``
+    field. The caller controls the time limit and nothing else: the search seed,
+    the single worker and the quiet solver log are fixed server-side so the same
+    request keeps producing the same preview.
+    """
+
+    semester = serializers.PrimaryKeyRelatedField(queryset=Semester.objects.all())
+    department = serializers.PrimaryKeyRelatedField(queryset=Department.objects.all())
+    max_time_seconds = serializers.IntegerField(
+        required=False,
+        default=DEFAULT_MAX_TIME_SECONDS,
+        min_value=MIN_GENERATION_TIME_SECONDS,
+        max_value=MAX_GENERATION_TIME_SECONDS,
+        help_text=(
+            "Solver time limit in seconds. Defaults to the engine default; the "
+            "difference between the limit and the actual run time is normal."
+        ),
+    )
+
+
+class GenerationSolverSerializer(serializers.Serializer):
+    """What the CP-SAT engine reported.
+
+    ``status`` is one of ``OPTIMAL``, ``FEASIBLE``, ``INFEASIBLE``,
+    ``MODEL_INVALID`` or ``UNKNOWN``. A ``FEASIBLE`` status means a valid timetable
+    was found without proving it optimal; it is never reported as ``OPTIMAL``.
+    """
+
+    status = serializers.ChoiceField(choices=[status.value for status in SolverStatus])
+    objective_value = serializers.IntegerField(allow_null=True, required=False)
+    wall_time_seconds = serializers.FloatField()
+    num_conflicts = serializers.IntegerField()
+    num_branches = serializers.IntegerField()
+    message = serializers.CharField(allow_blank=True, required=False)
+
+
+class GenerationSummarySerializer(serializers.Serializer):
+    """Counts of what was built and placed."""
+
+    components = serializers.IntegerField()
+    sessions = serializers.IntegerField()
+    candidates = serializers.IntegerField()
+    placements = serializers.IntegerField()
+
+
+class GenerationCourseSerializer(serializers.Serializer):
+    """Shallow course summary inside a placement."""
+
+    id = serializers.IntegerField()
+    code = serializers.CharField()
+    name = serializers.CharField()
+
+
+class GenerationOfferingSerializer(serializers.Serializer):
+    """Shallow offering summary inside a placement."""
+
+    id = serializers.IntegerField()
+    offering_code = serializers.CharField()
+
+
+class GenerationComponentSerializer(serializers.Serializer):
+    """Shallow teaching-component summary inside a placement."""
+
+    id = serializers.IntegerField()
+    component_type = serializers.CharField()
+    label = serializers.CharField(allow_blank=True, required=False)
+
+
+class GenerationSlotSerializer(serializers.Serializer):
+    """One occupied teaching period."""
+
+    id = serializers.IntegerField()
+    sequence = serializers.IntegerField()
+    label = serializers.CharField(allow_blank=True, required=False)
+    start_time = serializers.CharField()
+    end_time = serializers.CharField()
+
+
+class GenerationRoomSerializer(serializers.Serializer):
+    """Shallow room summary inside a placement."""
+
+    id = serializers.IntegerField()
+    code = serializers.CharField()
+    name = serializers.CharField()
+
+
+class GenerationInstructorSerializer(serializers.Serializer):
+    """Instructor used by a placement, with the role held on the component.
+
+    The preview row carries the instructor together with its assignment role, so
+    the id and name are read through that wrapper.
+    """
+
+    id = serializers.IntegerField(source="instructor.id")
+    full_name = serializers.CharField(source="instructor.full_name")
+    assignment_role = serializers.CharField(allow_null=True, required=False)
+
+
+class GenerationGroupSerializer(serializers.Serializer):
+    """Shallow student-group summary inside a placement."""
+
+    id = serializers.IntegerField()
+    code = serializers.CharField()
+    name = serializers.CharField()
+
+
+class GenerationPlacementSerializer(serializers.Serializer):
+    """One scheduled session in the preview.
+
+    All groups attached to the component are listed, including groups belonging to
+    other departments when the component is shared, because those students attend
+    the session.
+    """
+
+    session_id = serializers.CharField()
+    course = GenerationCourseSerializer()
+    offering = GenerationOfferingSerializer()
+    teaching_component = GenerationComponentSerializer()
+    day_of_week = serializers.IntegerField()
+    day_display = serializers.CharField()
+    slots = GenerationSlotSerializer(many=True)
+    start_time = serializers.CharField()
+    end_time = serializers.CharField()
+    room = GenerationRoomSerializer(allow_null=True, required=False)
+    instructors = GenerationInstructorSerializer(many=True)
+    student_groups = GenerationGroupSerializer(many=True)
+    penalty = serializers.IntegerField()
+
+
+class GenerationSessionCandidateCountSerializer(serializers.Serializer):
+    """Candidate count of one session, used by diagnostics."""
+
+    session_id = serializers.CharField()
+    component_id = serializers.IntegerField()
+    candidate_count = serializers.IntegerField()
+
+
+class GenerationDiagnosticsSerializer(serializers.Serializer):
+    """Counts gathered while building.
+
+    These are diagnostics, not a root cause: the solver proves that no timetable
+    exists, not why.
+    """
+
+    components = serializers.IntegerField()
+    sessions = serializers.IntegerField()
+    candidates = serializers.IntegerField()
+    min_candidates_per_session = serializers.IntegerField()
+    max_candidates_per_session = serializers.IntegerField()
+    sessions_with_fewest_candidates = GenerationSessionCandidateCountSerializer(
+        many=True
+    )
+    sessions_without_candidates = serializers.ListField(
+        child=serializers.CharField(), required=False
+    )
+
+
+class DepartmentGenerationResponseSerializer(serializers.Serializer):
+    """Response body of a completed generation request.
+
+    ``generated`` is true only when the solver returned placements. ``persisted``
+    is always false in this phase: nothing is written to the database, and no
+    schedule model exists yet.
+    """
+
+    generated = serializers.BooleanField()
+    persisted = serializers.BooleanField()
+    message = serializers.CharField(allow_blank=True, required=False)
+    semester = ValidationSemesterSerializer()
+    department = DepartmentSummarySerializer(allow_null=True, required=False)
+    validation = PreSchedulingValidationResponseSerializer(required=False)
+    solver = GenerationSolverSerializer(allow_null=True, required=False)
+    summary = GenerationSummarySerializer(allow_null=True, required=False)
+    placements = GenerationPlacementSerializer(many=True, required=False)
+    generation_issues = ValidationIssueSerializer(many=True, required=False)
+    diagnostics = GenerationDiagnosticsSerializer(allow_null=True, required=False)
+
+
+class GenerationRejectedSerializer(serializers.Serializer):
+    """Response body of a request that could not be generated.
+
+    ``reason`` is either ``PRE_SCHEDULING_VALIDATION_FAILED`` or
+    ``CANDIDATE_BUILD_FAILED``. The first carries the Phase 7 validation result;
+    the second carries adapter issues such as ``NO_PLACEMENT_CANDIDATES``.
+    """
+
+    generated = serializers.BooleanField()
+    persisted = serializers.BooleanField()
+    reason = serializers.CharField()
+    message = serializers.CharField(allow_blank=True, required=False)
+    semester = ValidationSemesterSerializer()
+    department = DepartmentSummarySerializer(allow_null=True, required=False)
+    validation = PreSchedulingValidationResponseSerializer(allow_null=True, required=False)
+    generation_issues = ValidationIssueSerializer(many=True, required=False)
+    diagnostics = GenerationDiagnosticsSerializer(allow_null=True, required=False)

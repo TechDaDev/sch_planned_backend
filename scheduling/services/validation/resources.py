@@ -163,13 +163,16 @@ class ResourceFacts:
         )
 
     @staticmethod
-    def _may_satisfy_shape(room: Room, requirement) -> bool:
+    def may_satisfy_shape(room: Room, requirement) -> bool:
         """Cheap necessary conditions used only to keep the room pool small.
 
         Every condition is implied by ``Room.meets_requirement``: a room failing
         one of them could never be suitable. Narrowing on them therefore cannot
         change the outcome; it only keeps the canonical check - which reads
         sharing rows and capabilities - off obviously hopeless rooms.
+
+        Public because the Phase 9 department scheduler reuses exactly this
+        narrowing before calling the same canonical helper.
         """
         if not room.is_active or not room.room_type.is_active:
             return False
@@ -188,7 +191,7 @@ class ResourceFacts:
         signature = self.requirement_signature(requirement)
         candidates: list[Room] = []
         for room in self.room_pool():
-            if not self._may_satisfy_shape(room, requirement):
+            if not self.may_satisfy_shape(room, requirement):
                 continue
             key = (room.pk, signature)
             verdict = self._suitability.get(key)

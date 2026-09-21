@@ -4,9 +4,9 @@ Django REST Framework backend for the College Academic Schedule Planner.
 Provides the project foundation (configuration package, domain app skeletons,
 custom user model, API/OpenAPI plumbing) that later phases build on.
 
-- Current phase: **Phase 8 — CP-SAT scheduling engine** (a reusable solver core for
-  already prepared discrete problems). No scheduling API, no `Schedule` models, no
-  persistence and no Django problem builder yet; those are Phase 9.
+- Current phase: **Phase 9 — department schedule generation** (a preview timetable
+  for one department, built from stored data and solved with CP-SAT). Nothing is
+  persisted: no `Schedule` models exist, and college-wide generation is Phase 10.
 
 ## Architecture
 
@@ -53,11 +53,12 @@ sch_planner_backend/
 │   │                  # ExceptionType, ExceptionScope
 │   ├── services/      # domain logic kept out of the views
 │   │   ├── validation/# issues, time_grid, resources, validator
-│   │   └── solver/    # domain, validator, model_builder, solver, result
+│   │   ├── solver/    # domain, validator, model_builder, solver, result
+│   │   └── generation/# blocks, candidates, preferences, preview, service
 │   ├── permissions.py # calendar visibility and validation scope rules
-│   ├── serializers.py # read/write serializers + validation contract
-│   ├── views.py       # time-grid viewsets + the validation endpoint
-│   ├── urls.py        # /api/working-days/, /api/scheduling/validate/, ...
+│   ├── serializers.py # resource, validation and generation contracts
+│   ├── views.py       # time-grid viewsets + validation and generation endpoints
+│   ├── urls.py        # /api/working-days/, /api/scheduling/generate/, ...
 │   └── migrations/    # 0001_calendar_and_time_configuration
 ├── reports/           # report exports (empty until later phases)
 ├── tests/             # pytest suite for the whole project
@@ -77,9 +78,11 @@ breaks inside those days, and the dated exceptions (holidays, exams, closures,
 absences) that remove availability. Phase 7 adds a computed pre-scheduling
 validator that reports whether the stored data is ready for timetable
 generation. Phase 8 adds the generic CP-SAT engine that turns a prepared discrete
-problem into a conflict-free assignment. A scheduling API, `Schedule` models,
-persistence and the Django problem builder do not exist yet; they are Phase 9.
-Reports and the Flutter instructor app follow later.
+problem into a conflict-free assignment. Phase 9 adds the department scheduler: it
+builds that prepared problem from the stored academic, resource and calendar data
+and returns a preview timetable. **Nothing is persisted yet** - no `Schedule`,
+`ScheduleVersion` or `ScheduleEntry` model exists - and college-wide generation is
+Phase 10. Reports and the Flutter instructor app follow later.
 
 ## Requirements
 
@@ -175,6 +178,7 @@ All resource APIs expose the same five operations — `GET` list, `GET` detail,
 | Break periods             | `/api/break-periods/`              | college-wide (writes: college admin)   |
 | Calendar exceptions       | `/api/calendar-exceptions/`        | scope-dependent (see the calendar section) |
 | Scheduling validation     | `POST /api/scheduling/validate/`   | see the validation section below       |
+| Department generation     | `POST /api/scheduling/generate/`   | own department (college admin: any)    |
 
 Write ownership in this table is stricter than read visibility for shared
 resources: shared instructors and rooms are readable by the departments they are
@@ -950,13 +954,206 @@ alternative.
 Phase 9 will provide the Django problem builder and the department scheduler on
 top of this engine.
 
+## Department schedule generation
+
+```
+POST /api/scheduling/generate/
+```
+
+```json
+{ "semester": 3, "department": 2, "max_time_seconds": 30 }
+```
+
+Builds the department's weekly scheduling problem from stored data, solves it with
+CP-SAT and returns the resulting timetable **preview**. Only the department scope
+exists in this phase: there is no `scope` field, and college-wide generation is
+Phase 10.
+
+`semester` and `department` are required; `max_time_seconds` is optional and
+defaults to 30 (accepted range 1–120). The caller cannot control the search seed,
+the worker count or the solver log: those are fixed server-side for
+reproducibility.
+
+**Nothing is persisted.** No `Schedule`, `ScheduleVersion` or `ScheduleEntry` model
+exists, no migration was added, and repeated requests against unchanged data return
+the same preview. Every response carries `"persisted": false`.
+
+### Authorization
+
+`COLLEGE_ADMIN` and superusers may generate any department; `DEPARTMENT_ADMIN` and
+`SCHEDULER` only their own; `VIEWER` and `INSTRUCTOR` are refused (`403`). A
+department-scoped caller without a department fails closed. The department scope is
+resolved by the same Phase 7 rule the validation endpoint uses, so the two
+endpoints cannot drift apart.
+
+### The validation gate
+
+Generation calls the Phase 7 validator service directly - never the HTTP endpoint -
+for the requested semester and department. If the scope is not ready the request
+stops with `409` and the Phase 7 result is returned inline:
+
+```json
+{
+  "generated": false,
+  "persisted": false,
+  "reason": "PRE_SCHEDULING_VALIDATION_FAILED",
+  "validation": { "ready": false, "summary": {}, "issues": [] }
+}
+```
+
+Warnings do **not** block generation: a ready scope with warnings generates
+normally and the warnings come back in the `validation` block.
+
+### Session expansion
+
+Each active teaching component of the requested department becomes as many session
+demands as it has weekly sessions (`weekly_hours / session_duration_hours`). A
+component with 4 weekly hours in 2-hour sessions becomes `component:15:session:1`
+and `component:15:session:2`. Identifiers are stable across repeated generation.
+
+Every candidate for a session carries **all** active assigned instructors (primary
+and assistants) and **all** student groups attached to the component, sorted
+deterministically. The adapter never decides which instructor teaches a session,
+and never expands or infers groups: the joint-course groups of another department
+travel with the component exactly as Phase 3 configured them.
+
+### Exact discrete slot blocks
+
+The timetable grid is discrete, so a session must occupy adjacent teaching periods
+whose durations sum to **exactly** its length. 90 minutes fit `08:00-08:45` +
+`08:45-09:30`, and also `30 + 60` or `30 + 30 + 30`, because period lengths may
+differ. Two 60-minute periods are 120 minutes and must **not** serve a 90-minute
+session: that would reserve teaching time the session does not use.
+
+This is deliberately stricter than the Phase 7 check, which only asks whether *some*
+contiguous block is at least as long as the session. A scope can therefore be
+`ready: true` and still be unbuildable here, and that difference is reported
+cleanly rather than rounded away:
+
+```json
+{
+  "generated": false,
+  "persisted": false,
+  "reason": "CANDIDATE_BUILD_FAILED",
+  "generation_issues": [
+    {
+      "code": "NO_PLACEMENT_CANDIDATES",
+      "severity": "ERROR",
+      "entity_type": "TeachingComponent",
+      "entity_id": 15,
+      "details": { "session_id": "component:15:session:1", "required_duration_minutes": 90 }
+    }
+  ],
+  "diagnostics": { "sessions": 2, "sessions_without_candidates": ["component:15:session:1"] }
+}
+```
+
+### Instructor and room filtering
+
+A candidate block is valid only when **every** assigned active instructor is
+available for the whole block, and the room is available for the whole block too. A
+period counts only when it lies fully inside an availability window of the matching
+weekday. An assistant who cannot cover the block removes the candidate, and missing
+availability is never read as unrestricted availability — for instructors or rooms.
+
+Rooms come from the canonical Phase 5 rule, so a room owned by another department is
+a candidate whenever sharing allows this department to use it. Shared rooms and
+shared instructors are used normally: eligibility is the only gate, and ownership
+stops mattering afterwards.
+
+### Preference penalties
+
+The candidate penalty is the sum over assigned instructors of:
+
+| Situation | Penalty |
+| --- | --- |
+| Interval overlaps an active `AVOID` window (wins over everything) | 20 |
+| Interval lies entirely inside an active `PREFERRED` window | 0 |
+| Neither | 5 |
+
+Only active preferences for the requested semester count, and preferences are soft:
+an `AVOID` window never removes a candidate, it only makes it expensive. Assistant
+instructors count exactly like primary instructors. The constants live in one
+place, `scheduling/services/generation/preferences.py`.
+
+This is the only soft objective in Phase 9. Gap minimisation, day spreading, theory
+before practical, daily balancing and period-order penalties need pairwise or global
+terms and belong to a later optimisation phase.
+
+### Result handling
+
+| Solver status | HTTP | `generated` | Placements |
+| --- | --- | --- | --- |
+| `OPTIMAL` | 200 | true | returned |
+| `FEASIBLE` | 200 | true | returned, clearly not labelled optimal |
+| `INFEASIBLE` | 200 | false | empty, with `SOLVER_INFEASIBLE` and diagnostics |
+| `UNKNOWN` | 200 | false | empty, with `SOLVER_UNKNOWN` (usually the time limit) |
+| `MODEL_INVALID` | 200 | false | empty, with `SOLVER_MODEL_INVALID` |
+
+A completed run that found no timetable is a `200`, because the request itself was
+valid. `UNKNOWN` is never reported as `INFEASIBLE`, and a feasible solution is never
+reported as optimal. Diagnostics report counts only - sessions, candidates, the
+sessions with the fewest candidates and those with none - and are explicitly
+diagnostics rather than a proven root cause.
+
+### Preview shape
+
+A successful response carries `generated`, `persisted`, the semester and
+department, the validation summary, the solver block, `summary` counts and
+`placements`. Each placement is flat and shallow: session id, course, offering,
+teaching component, weekday plus display label, the occupied periods, derived
+`start_time`/`end_time`, room, instructors with their assignment role, all student
+groups, and the candidate penalty.
+
+Only resources that take part in this department's generation are described, so a
+preview cannot leak another department's catalogue. Diagnostics expose counts, never
+foreign identities.
+
+### Not in Phase 9
+
+- no `scope=COLLEGE`: one managing department per request, and a component shared
+  with this department belongs to the department that manages it;
+- no persistence, versioning, approval or publication;
+- no manual editing;
+- no choice of instructor per session (Phase 4 decided that);
+- no collision solving inside the adapter: the adapter supplies ids and the engine
+  enforces instructor, group, room and component conflicts globally;
+- no calendar-exception subtraction from the recurring weekly grid, matching the
+  Phase 7 limitation;
+- no candidate cap: every valid candidate is generated, so a solution is never lost
+  to a truncation heuristic.
+
+### Architecture
+
+```
+scheduling/services/generation/
+├── blocks.py       # exact contiguous slot-block arithmetic (pure)
+├── preferences.py  # preference windows and penalty constants (pure)
+├── candidates.py   # Django adapter: sessions, candidates, diagnostics, room grid
+├── domain.py       # bundle, diagnostics, preview and outcome value objects
+├── issues.py       # stable generation issue codes
+├── preview.py      # placements to flat preview rows
+└── service.py      # validate -> build -> solve -> preview
+```
+
+The pipeline reads its data once with `select_related`/`prefetch_related` - the
+component graph, the grid, instructor availability and preferences, rooms with
+their capabilities and grants, and room availability - and then works in memory, so
+the `session x block x room` cross product never touches the database. Room
+suitability reuses the canonical Phase 5 helper, memoised per requirement shape, and
+its capability links are prefetched with `select_related` so the Phase 7 capability
+N+1 fix stays fixed.
+
+Phase 8's `scheduling.services.solver` package remains pure and never imports this
+adapter.
+
 ## Who may write what
 
 | Role | Reads | Writes |
 | --- | --- | --- |
-| `COLLEGE_ADMIN` or Django superuser | everything | everything: colleges, academic years, semesters, joint-course group associations, instructor profiles, sharing grants, availability, preferences, assignments, room types, room capabilities, rooms, room grants, room capabilities and availability, teaching-component room requirements, working days, time slots, breaks and calendar exceptions; may run validation for the whole college or any department |
-| `DEPARTMENT_ADMIN` | own department plus joint components their students attend, instructors shared with them, rooms they may use, and calendar exceptions in their scope | own department: update it; manage programs, stages, groups, courses, offerings, components, component/group links (own groups only), instructor profiles, sharing grants, availability, preferences, assignments on components their department manages, own rooms with their grants, capabilities and availability, room requirements for components their department manages, and calendar exceptions for own-department resources; may run validation for **its own department only** |
-| `SCHEDULER` | own department plus joint components their students attend, instructors shared with them, rooms they may use, and the calendar grid and exceptions in their scope | none — every Phase 2–6 resource is read-only for this role, but it may run validation for **its own department only** |
+| `COLLEGE_ADMIN` or Django superuser | everything | everything: colleges, academic years, semesters, joint-course group associations, instructor profiles, sharing grants, availability, preferences, assignments, room types, room capabilities, rooms, room grants, room capabilities and availability, teaching-component room requirements, working days, time slots, breaks and calendar exceptions; may run validation for the whole college or any department, and may generate a preview for any department |
+| `DEPARTMENT_ADMIN` | own department plus joint components their students attend, instructors shared with them, rooms they may use, and calendar exceptions in their scope | own department: update it; manage programs, stages, groups, courses, offerings, components, component/group links (own groups only), instructor profiles, sharing grants, availability, preferences, assignments on components their department manages, own rooms with their grants, capabilities and availability, room requirements for components their department manages, and calendar exceptions for own-department resources; may run validation for **its own department only**, and may generate a preview for **its own department only** |
+| `SCHEDULER` | own department plus joint components their students attend, instructors shared with them, rooms they may use, and the calendar grid and exceptions in their scope | none — every Phase 2–6 resource is read-only for this role, but it may run validation for **its own department only** and generate a preview for **its own department only** |
 | `VIEWER`, `INSTRUCTOR` | own department plus joint components their students attend, instructors shared with them, rooms they may use, and the calendar grid and exceptions in their scope | none — every Phase 2–6 resource is read-only for these roles, and they may **not** run validation |
 
 A department can never modify a shared instructor or room, inspect availability
@@ -1030,9 +1227,12 @@ not used.
 - **Phase 8 (done)** — the generic CP-SAT scheduling engine: session demands,
   placement candidates, hard resource conflicts, optional reservations and a
   weighted candidate objective, with no API and no persistence.
-- **Phase 9 (planned)** — the Django problem builder and department scheduler:
-  build candidates from the academic, resource and calendar data, persist
-  `Schedule`/`ScheduleEntry` records and expose the scheduling API.
-- **Later** — reports/export, PostgreSQL, background jobs, Railway deployment.
+- **Phase 9 (done)** — the department scheduler: the Django problem builder,
+  session expansion, exact slot blocks, preference penalties and the preview
+  endpoint. Preview only, nothing persisted.
+- **Phase 10 (planned)** — college-wide generation across managing departments.
+- **Later** — `Schedule`/`ScheduleVersion`/`ScheduleEntry` persistence and
+  versioning, approval and publication, manual editing, reports/export,
+  PostgreSQL, background jobs, Railway deployment.
 - **Flutter instructor app** — after the web application, using
   `/api/me/teaching-assignments/` as one of its first endpoints.
