@@ -20,6 +20,10 @@ Phase 7 adds the validation scope rules: the validator is an operational tool, s
 ``VIEWER`` and ``INSTRUCTOR`` may not run it, a department-scoped user may only
 validate its own department (and never the whole college), and a department-scoped
 user without a department fails closed.
+
+Phase 10 adds the college-wide generation gate: scheduling every department at once
+is a college-level act, so ``COLLEGE_ADMIN`` and superusers may run it and nobody
+else can reach it through this API.
 """
 
 from django.db import models
@@ -115,6 +119,31 @@ class CanRunPreSchedulingValidation(BasePermission):
         return user.role in self.allowed_roles
 
 
+class CanRunCollegeScheduleGeneration(BasePermission):
+    """Role gate for the college-wide generation endpoint.
+
+    Scheduling every department in one problem is a college-level act, so only a
+    college administrator (or a Django superuser) may do it.
+
+    ``DEPARTMENT_ADMIN``, ``SCHEDULER``, ``VIEWER`` and ``INSTRUCTOR`` are denied
+    regardless of the department they belong to, and the endpoint takes no scope
+    parameter that could relax this: there is no request body that lets a
+    department-scoped caller reach the college-wide solver. Cross-department access
+    is the same property Phase 7 uses to authorize college-wide validation, so the
+    two endpoints cannot disagree about who is a college administrator.
+
+    This gate is about *running* the solver. It never widens academic data: the
+    candidate builder still enforces each component's managing-department resource
+    rules, so a college administrator cannot schedule an instructor or a room that
+    sharing rules withhold from a department.
+    """
+
+    def has_permission(self, request, view) -> bool:
+        if not is_authenticated_active_user(request):
+            return False
+        return request.user.has_cross_department_access
+
+
 def resolve_validation_scope(user, *, scope, department):
     """Authorize a validation request and return the department to validate.
 
@@ -156,6 +185,7 @@ def resolve_validation_scope(user, *, scope, department):
 
 __all__ = [
     "CanManageCalendarExceptions",
+    "CanRunCollegeScheduleGeneration",
     "CanRunPreSchedulingValidation",
     "resolve_validation_scope",
     "visible_calendar_exceptions_filter",

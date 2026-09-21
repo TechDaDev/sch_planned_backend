@@ -9,6 +9,10 @@ The cross-field rules (grid boundaries, overlap, exception scope and semester
 range) live on the models and run through ``ModelCleanValidationMixin``, so
 predictable violations answer ``400``. Grid writes are restricted to college
 administrators by the views.
+
+Generation request/response bodies keep the two scopes explicit: the department
+endpoint has no ``scope`` field, and the college-wide endpoint has no
+``department`` field, so neither can be silently turned into the other.
 """
 
 from drf_spectacular.utils import PolymorphicProxySerializer, extend_schema_field
@@ -40,6 +44,11 @@ from scheduling.services.validation import Severity, ValidationScope
 #: Bounds the API accepts for the solver time limit.
 MIN_GENERATION_TIME_SECONDS = 1
 MAX_GENERATION_TIME_SECONDS = 120
+
+#: College-wide problems are naturally larger, so their default and ceiling differ.
+DEFAULT_COLLEGE_GENERATION_TIME_SECONDS = 60
+MIN_COLLEGE_GENERATION_TIME_SECONDS = 1
+MAX_COLLEGE_GENERATION_TIME_SECONDS = 300
 
 
 class WorkingDaySummarySerializer(serializers.ModelSerializer):
@@ -621,3 +630,140 @@ class GenerationRejectedSerializer(serializers.Serializer):
     validation = PreSchedulingValidationResponseSerializer(allow_null=True, required=False)
     generation_issues = ValidationIssueSerializer(many=True, required=False)
     diagnostics = GenerationDiagnosticsSerializer(allow_null=True, required=False)
+
+
+# --- Phase 10: college-wide schedule generation ----------------------------
+
+
+class CollegeScheduleGenerationInputSerializer(serializers.Serializer):
+    """Request body of ``POST /api/scheduling/generate-college/``.
+
+    The scope is the endpoint itself, so there is no ``scope`` or ``department``
+    field: a caller cannot ask this endpoint for less than the whole college. The
+    caller controls the time limit and nothing else - the search seed, the single
+    worker and the quiet solver log stay fixed server-side so the same request keeps
+    producing the same preview.
+
+    A college-wide problem contains every department's sessions at once, so the
+    accepted time limit is wider than the department endpoint's.
+    """
+
+    semester = serializers.PrimaryKeyRelatedField(queryset=Semester.objects.all())
+    max_time_seconds = serializers.IntegerField(
+        required=False,
+        default=DEFAULT_COLLEGE_GENERATION_TIME_SECONDS,
+        min_value=MIN_COLLEGE_GENERATION_TIME_SECONDS,
+        max_value=MAX_COLLEGE_GENERATION_TIME_SECONDS,
+        help_text=(
+            "Solver time limit in seconds. Defaults to 60 for a college-wide "
+            "problem; the difference between the limit and the actual run time is "
+            "normal."
+        ),
+    )
+
+
+class GenerationDepartmentBuildCountSerializer(serializers.Serializer):
+    """How much one managing department contributed to the built problem."""
+
+    department = DepartmentSummarySerializer()
+    components = serializers.IntegerField()
+    sessions = serializers.IntegerField()
+    candidates = serializers.IntegerField()
+
+
+class GenerationDepartmentSummarySerializer(serializers.Serializer):
+    """One managing department's share of a finished college-wide run.
+
+    ``placements`` counts components managed by that department, so a joint
+    component serving foreign student groups is counted once, for its managing
+    department, and never for the departments that merely attend it.
+    """
+
+    department = DepartmentSummarySerializer()
+    components = serializers.IntegerField()
+    sessions = serializers.IntegerField()
+    candidates = serializers.IntegerField()
+    placements = serializers.IntegerField()
+
+
+class CollegeGenerationSummarySerializer(serializers.Serializer):
+    """Counts of what a college-wide build covered and placed."""
+
+    departments = serializers.IntegerField()
+    components = serializers.IntegerField()
+    sessions = serializers.IntegerField()
+    candidates = serializers.IntegerField()
+    placements = serializers.IntegerField()
+
+
+class CollegeGenerationDiagnosticsSerializer(GenerationDiagnosticsSerializer):
+    """Department-scoped diagnostics plus the per-department build counts.
+
+    These are still diagnostics, not a root cause: the solver proves that no
+    timetable exists, not why.
+    """
+
+    departments = serializers.IntegerField()
+    department_breakdown = GenerationDepartmentBuildCountSerializer(many=True)
+
+
+class CollegeGenerationPlacementSerializer(GenerationPlacementSerializer):
+    """One college-wide placement, additionally naming its managing department.
+
+    The department endpoint's placement body is deliberately left unchanged; this
+    subclass adds the one field a college-wide preview cannot infer, and adds it
+    after the inherited fields.
+    """
+
+    managing_department = DepartmentSummarySerializer(allow_null=True, required=False)
+
+
+class CollegeGenerationResponseSerializer(serializers.Serializer):
+    """Response body of a completed college-wide generation request.
+
+    ``generated`` is true only when the solver returned placements; an infeasible or
+    timed-out solve is still a ``200`` with ``generated: false``.
+    ``persisted`` is always false in this phase: nothing is written and no schedule
+    model exists yet.
+
+    ``department_summaries`` is ordered by department code, then department id.
+    """
+
+    generated = serializers.BooleanField()
+    persisted = serializers.BooleanField()
+    scope = serializers.ChoiceField(choices=ValidationScope.choices)
+    message = serializers.CharField(allow_blank=True, required=False)
+    semester = ValidationSemesterSerializer()
+    validation = PreSchedulingValidationResponseSerializer(required=False)
+    solver = GenerationSolverSerializer(allow_null=True, required=False)
+    summary = CollegeGenerationSummarySerializer(allow_null=True, required=False)
+    department_summaries = GenerationDepartmentSummarySerializer(
+        many=True, required=False
+    )
+    placements = CollegeGenerationPlacementSerializer(many=True, required=False)
+    generation_issues = ValidationIssueSerializer(many=True, required=False)
+    diagnostics = CollegeGenerationDiagnosticsSerializer(
+        allow_null=True, required=False
+    )
+
+
+class CollegeGenerationRejectedSerializer(serializers.Serializer):
+    """Response body of a college-wide request that could not be generated.
+
+    ``reason`` is either ``PRE_SCHEDULING_VALIDATION_FAILED``, which carries the
+    Phase 7 college-wide validation result, or ``CANDIDATE_BUILD_FAILED``, which
+    carries adapter issues such as ``NO_PLACEMENT_CANDIDATES``. Neither outcome ran
+    OR-Tools.
+    """
+
+    generated = serializers.BooleanField()
+    persisted = serializers.BooleanField()
+    scope = serializers.ChoiceField(choices=ValidationScope.choices)
+    reason = serializers.CharField()
+    message = serializers.CharField(allow_blank=True, required=False)
+    semester = ValidationSemesterSerializer()
+    validation = PreSchedulingValidationResponseSerializer(allow_null=True, required=False)
+    generation_issues = ValidationIssueSerializer(many=True, required=False)
+    diagnostics = CollegeGenerationDiagnosticsSerializer(
+        allow_null=True, required=False
+    )

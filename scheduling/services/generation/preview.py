@@ -5,8 +5,10 @@ it is, when it happens, where, and who is involved. Everything it needs was alre
 loaded while building the problem, so no query runs here and no Django object
 appears in the result.
 
-Only resources that participate in the requested department's generation are
-described, which keeps a preview from leaking another department's catalogue.
+Only resources that participate in the generated problem are described, which keeps
+a preview from leaking another department's catalogue: a department preview cannot
+name a foreign instructor, while a college preview legitimately covers the whole
+college because that is what it was asked to schedule.
 """
 
 from __future__ import annotations
@@ -19,6 +21,19 @@ from scheduling.services.generation.domain import (
     SlotInfo,
 )
 from scheduling.services.solver import ScheduledPlacement
+
+
+def session_ordinal(session_id: str) -> int:
+    """Numeric ordinal of a ``component:<id>:session:<ordinal>`` identifier.
+
+    Used only for ordering. An identifier that does not follow the convention sorts
+    first rather than raising, so a future identifier shape cannot break a preview.
+    """
+    _, _, tail = session_id.rpartition(":")
+    try:
+        return int(tail)
+    except ValueError:
+        return 0
 
 
 class PreviewBuilder:
@@ -66,6 +81,7 @@ class PreviewBuilder:
                         if group_id in self._bundle.group_map
                     ),
                     penalty=placement.penalty,
+                    managing_department=context.component.managing_department,
                     raw=placement,
                 )
             )
@@ -90,4 +106,38 @@ class PreviewBuilder:
             return str(day_of_week)
 
 
-__all__ = ["PreviewBuilder"]
+class CollegePreviewBuilder(PreviewBuilder):
+    """Preview rows of a college-wide solve, in a documented stable order.
+
+    The engine's own order is already deterministic but groups by day rather than
+    by department. A college preview is far more readable grouped per managing
+    department, so rows are re-sorted by department code, weekday, first period,
+    course code, component id and session ordinal - all values that come straight
+    from stored data, so the order repeats exactly on an unchanged database.
+    """
+
+    def build(
+        self, placements: tuple[ScheduledPlacement, ...]
+    ) -> tuple[PreviewPlacement, ...]:
+        previews = super().build(placements)
+        return tuple(
+            sorted(
+                previews,
+                key=lambda preview: (
+                    (
+                        preview.managing_department.code,
+                        preview.managing_department.id,
+                    )
+                    if preview.managing_department is not None
+                    else ("", 0),
+                    preview.day_of_week,
+                    preview.start_time,
+                    preview.course.code,
+                    preview.teaching_component.id,
+                    session_ordinal(preview.session_id),
+                ),
+            )
+        )
+
+
+__all__ = ["CollegePreviewBuilder", "PreviewBuilder", "session_ordinal"]

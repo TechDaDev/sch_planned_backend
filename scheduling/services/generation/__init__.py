@@ -1,17 +1,20 @@
-"""Department schedule generation (Phase 9).
+"""Schedule generation (Phases 9 and 10).
 
 The adapter layer between stored data and the pure CP-SAT engine:
 
-* ``candidates.DepartmentProblemBuilder`` - the Django adapter. Reads the academic,
+* ``candidates.GenerationProblemBuilder`` - the Django adapter. Reads the academic,
   resource and calendar data, expands teaching components into weekly sessions and
-  generates every valid placement candidate.
+  generates every valid placement candidate. ``DepartmentProblemBuilder`` scopes it
+  to one managing department, ``CollegeProblemBuilder`` to the whole semester.
 * ``blocks.find_exact_contiguous_slot_blocks`` - pure discrete-grid arithmetic. A
   session occupies adjacent periods whose durations sum *exactly* to its length.
 * ``preferences.PreferencePenaltyCalculator`` - the soft preference policy, mapping
   instructor PREFERRED/AVOID windows onto the engine's generic penalty.
-* ``preview.PreviewBuilder`` - flat, readable description of each chosen placement.
-* ``service.DepartmentScheduleGenerator`` - the pipeline: validate, build, solve,
-  preview. Nothing is persisted.
+* ``preview.PreviewBuilder`` - flat, readable description of each chosen placement;
+  ``CollegePreviewBuilder`` adds the documented department-first ordering.
+* ``service.ScheduleGenerationPipeline`` - the pipeline: validate, build, solve,
+  preview. ``DepartmentScheduleGenerator`` and ``CollegeScheduleGenerator`` are its
+  two scopes. Nothing is persisted.
 
 Only this package knows about Django; ``scheduling.services.solver`` stays pure and
 must never import from here.
@@ -24,10 +27,18 @@ from scheduling.services.generation.blocks import (
     find_exact_contiguous_slot_blocks,
     group_slots_by_weekday,
 )
-from scheduling.services.generation.candidates import DepartmentProblemBuilder
+from scheduling.services.generation.candidates import (
+    CollegeProblemBuilder,
+    DepartmentProblemBuilder,
+    GenerationProblemBuilder,
+)
 from scheduling.services.generation.domain import (
+    CollegeGenerationSummary,
     ComponentInfo,
     CourseInfo,
+    DepartmentBuildCount,
+    DepartmentGenerationSummary,
+    DepartmentInfo,
     GenerationDiagnostics,
     GenerationOutcome,
     GenerationSummary,
@@ -54,8 +65,16 @@ from scheduling.services.generation.preferences import (
     PreferencePenaltyCalculator,
     build_preference_windows,
 )
-from scheduling.services.generation.preview import PreviewBuilder
-from scheduling.services.generation.service import DepartmentScheduleGenerator
+from scheduling.services.generation.preview import (
+    CollegePreviewBuilder,
+    PreviewBuilder,
+    session_ordinal,
+)
+from scheduling.services.generation.service import (
+    CollegeScheduleGenerator,
+    DepartmentScheduleGenerator,
+    ScheduleGenerationPipeline,
+)
 
 __all__ = [
     "PENALTY_AVOID",
@@ -63,13 +82,21 @@ __all__ = [
     "PENALTY_PREFERRED",
     "REASON_CANDIDATE_BUILD_FAILED",
     "REASON_VALIDATION_FAILED",
+    "CollegeGenerationSummary",
+    "CollegePreviewBuilder",
+    "CollegeProblemBuilder",
+    "CollegeScheduleGenerator",
     "ComponentInfo",
     "CourseInfo",
+    "DepartmentBuildCount",
+    "DepartmentGenerationSummary",
+    "DepartmentInfo",
     "DepartmentProblemBuilder",
     "DepartmentScheduleGenerator",
     "GenerationDiagnostics",
     "GenerationIssueCode",
     "GenerationOutcome",
+    "GenerationProblemBuilder",
     "GenerationSummary",
     "GridSlot",
     "GroupInfo",
@@ -81,6 +108,7 @@ __all__ = [
     "PreviewPlacement",
     "ProblemBundle",
     "RoomInfo",
+    "ScheduleGenerationPipeline",
     "SessionCandidateCount",
     "SessionContext",
     "SlotBlock",
@@ -89,4 +117,5 @@ __all__ = [
     "find_exact_blocks_by_weekday",
     "find_exact_contiguous_slot_blocks",
     "group_slots_by_weekday",
+    "session_ordinal",
 ]

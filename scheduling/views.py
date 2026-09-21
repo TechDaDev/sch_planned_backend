@@ -21,6 +21,7 @@ from resources.views import QueryParameterFilterMixin
 from scheduling.models import BreakPeriod, CalendarException, TimeSlot, WorkingDay
 from scheduling.permissions import (
     CanManageCalendarExceptions,
+    CanRunCollegeScheduleGeneration,
     CanRunPreSchedulingValidation,
     resolve_validation_scope,
     visible_calendar_exceptions_filter,
@@ -30,6 +31,9 @@ from scheduling.serializers import (
     BreakPeriodWriteSerializer,
     CalendarExceptionSerializer,
     CalendarExceptionWriteSerializer,
+    CollegeGenerationRejectedSerializer,
+    CollegeGenerationResponseSerializer,
+    CollegeScheduleGenerationInputSerializer,
     DepartmentGenerationResponseSerializer,
     GenerationRejectedSerializer,
     PreSchedulingValidationInputSerializer,
@@ -40,7 +44,10 @@ from scheduling.serializers import (
     WorkingDaySerializer,
     WorkingDayWriteSerializer,
 )
-from scheduling.services.generation import DepartmentScheduleGenerator
+from scheduling.services.generation import (
+    CollegeScheduleGenerator,
+    DepartmentScheduleGenerator,
+)
 from scheduling.services.validation import PreSchedulingValidator, ValidationScope
 
 CALENDAR_TAGS = ["calendar"]
@@ -221,7 +228,8 @@ class DepartmentScheduleGenerationView(APIView):
         description=(
             "Builds the department's weekly scheduling problem from stored data, "
             "solves it with CP-SAT and returns the resulting preview. "
-            "Department scope only: college-wide generation is a later phase.\n\n"
+            "Department scope only; college-wide generation is "
+            "``POST /api/scheduling/generate-college/``.\n\n"
             "The endpoint never writes: ``persisted`` is always false. Candidates "
             "come from exact contiguous slot blocks that sum precisely to the "
             "component's session length, from rooms the canonical Phase 5 rules "
@@ -271,5 +279,88 @@ class DepartmentScheduleGenerationView(APIView):
             )
         return Response(
             DepartmentGenerationResponseSerializer(outcome).data,
+            status=status.HTTP_200_OK,
+        )
+
+
+@extend_schema(tags=SCHEDULING_TAGS)
+class CollegeScheduleGenerationView(APIView):
+    """Generate a college-wide preview timetable for one semester.
+
+    Every active teaching component of the semester, in every department, is built
+    into **one** Phase 8 problem and solved once. That is what makes a shared
+    instructor, a shared room or a joint student group impossible to double-book:
+    solving each department separately and merging the results cannot see the
+    collisions that the college-wide problem constrains globally.
+
+    Access is limited to a college administrator or a Django superuser. Department
+    administrators, schedulers, viewers and instructors are denied whatever their
+    department is, and the request body has no scope field that could relax this.
+
+    The Phase 7 gate runs with ``COLLEGE`` scope. A gate failure answers ``409`` with
+    ``PRE_SCHEDULING_VALIDATION_FAILED``, and a session without a single candidate
+    answers ``409`` with ``CANDIDATE_BUILD_FAILED``; neither case calls OR-Tools. A
+    completed run that finds no timetable is a ``200`` with ``generated: false``.
+
+    Nothing is persisted: ``persisted`` is always false and no schedule model
+    exists yet.
+    """
+
+    permission_classes = [IsAuthenticated, CanRunCollegeScheduleGeneration]
+
+    @extend_schema(
+        summary="Generate a college-wide timetable preview",
+        description=(
+            "Builds one scheduling problem across every department of the "
+            "semester, solves it once with CP-SAT and returns the resulting "
+            "preview. College administrators only: department administrators and "
+            "schedulers cannot reach this endpoint.\n\n"
+            "Because all departments share one problem, a shared instructor, a "
+            "shared room and a joint student group are constrained globally "
+            "instead of department by department. The endpoint never writes: "
+            "``persisted`` is always false.\n\n"
+            "Candidates come from exact contiguous slot blocks that sum precisely "
+            "to the component's session length, from rooms the canonical Phase 5 "
+            "rules allow the component's managing department to use, and from "
+            "blocks every assigned instructor and the room are available for. "
+            "Preference windows only influence the weighted objective, never "
+            "feasibility, and the penalty weights are identical to the department "
+            "endpoint's."
+        ),
+        request=CollegeScheduleGenerationInputSerializer,
+        responses={
+            200: CollegeGenerationResponseSerializer,
+            400: OpenApiResponse(
+                description=(
+                    "Malformed body, unknown semester id, or a time limit outside "
+                    "the accepted range."
+                )
+            ),
+            401: OpenApiResponse(description="Authentication required."),
+            403: OpenApiResponse(
+                description=(
+                    "The caller is not a college administrator, so the college-wide "
+                    "solver is out of reach."
+                )
+            ),
+            409: CollegeGenerationRejectedSerializer,
+        },
+    )
+    def post(self, request):
+        serializer = CollegeScheduleGenerationInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        outcome = CollegeScheduleGenerator(
+            semester=data["semester"],
+            max_time_seconds=data["max_time_seconds"],
+        ).generate()
+
+        if outcome.rejected:
+            return Response(
+                CollegeGenerationRejectedSerializer(outcome).data,
+                status=status.HTTP_409_CONFLICT,
+            )
+        return Response(
+            CollegeGenerationResponseSerializer(outcome).data,
             status=status.HTTP_200_OK,
         )

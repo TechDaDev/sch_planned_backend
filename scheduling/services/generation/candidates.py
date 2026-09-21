@@ -5,9 +5,22 @@ exist, which periods can hold them, which rooms are allowed, and how expensive a
 placement is. It reads the academic, resource and calendar data once, works in
 memory afterwards, and hands the pure engine a prepared discrete problem.
 
-Scope is one department of one semester: active components of active offerings
-whose managing department is the requested department. A component that merely
-shares students with that department belongs to the department that manages it.
+Two scopes share this one implementation:
+
+* :class:`DepartmentProblemBuilder` covers the active components of one managing
+  department, which is what the Phase 9 endpoint asks for;
+* :class:`CollegeProblemBuilder` covers every active component of the semester
+  across all managing departments, which is what the Phase 10 endpoint asks for.
+
+Both extend :class:`GenerationProblemBuilder`, so slot blocks, room suitability,
+instructor availability, preference penalties, session identity and candidate
+identity are literally the same code. The only differences are which components
+are demand and how the diagnostics are grouped.
+
+A component belongs to the department that manages its offering. A joint component
+that several departments attend stays *one* component with *one* set of weekly
+sessions: its candidates carry every attached student group, so the engine can
+enforce group conflicts globally instead of the adapter guessing at them.
 
 The builder never solves anything. Instructor, group and room collisions are left
 to the engine, which enforces them globally; the adapter only supplies the ids.
@@ -38,6 +51,8 @@ from scheduling.services.generation.blocks import (
 from scheduling.services.generation.domain import (
     ComponentInfo,
     CourseInfo,
+    DepartmentBuildCount,
+    DepartmentInfo,
     GenerationDiagnostics,
     GroupInfo,
     InstructorInfo,
@@ -77,10 +92,16 @@ def _windows_by_weekday(
     return {weekday: tuple(sorted(values)) for weekday, values in grouped.items()}
 
 
-class DepartmentProblemBuilder:
-    """Builds one department's discrete scheduling problem for one semester."""
+class GenerationProblemBuilder:
+    """Shared adapter for department-scoped and college-scoped generation.
 
-    def __init__(self, *, semester, department) -> None:
+    Subclasses only decide *which* components are demand, *how* the problem is
+    named, and which extra fields their issues carry. Everything that decides
+    sessions, candidates, availability, suitability and penalties lives here, so
+    the two scopes cannot drift apart.
+    """
+
+    def __init__(self, *, semester, department=None) -> None:
         self.semester = semester
         self.department = department
         self._issues: list[ValidationIssue] = []
@@ -99,6 +120,24 @@ class DepartmentProblemBuilder:
         self._room_suitability: dict[tuple[int, tuple], bool] = {}
         self._preferences: PreferencePenaltyCalculator | None = None
         self._components_considered = 0
+        self._department_info: dict[int, DepartmentInfo] = {}
+        self._department_components: dict[int, int] = {}
+        self._department_sessions: dict[int, int] = {}
+        self._department_candidates: dict[int, int] = {}
+
+    # --- subclass hooks ----------------------------------------------------
+
+    def _components_queryset(self):
+        """The active components this scope has to schedule."""
+        raise NotImplementedError
+
+    def _problem_name(self) -> str:
+        """Human-readable name of the built problem, used for logging only."""
+        raise NotImplementedError
+
+    def _issue_details(self, component) -> dict:
+        """Extra issue fields for this scope, empty by default."""
+        return {}
 
     # --- entry point -------------------------------------------------------
 
@@ -118,7 +157,7 @@ class DepartmentProblemBuilder:
                 sessions=tuple(self._sessions),
                 candidates=tuple(self._candidates),
                 reservations=(),
-                name=f"department:{self.department.pk}:semester:{self.semester.pk}",
+                name=self._problem_name(),
             ),
             sessions=tuple(self._sessions),
             candidates=tuple(self._candidates),
@@ -134,7 +173,7 @@ class DepartmentProblemBuilder:
     # --- loading -----------------------------------------------------------
 
     def _load_components(self):
-        """Active components managed by this department in this semester.
+        """Active components of this scope in this semester.
 
         The offering, course and managing department must all be active, so a
         component whose dependency chain is switched off is not demand. Rooms and
@@ -143,13 +182,7 @@ class DepartmentProblemBuilder:
         suitability helper never point-looks-up a capability per link.
         """
         return (
-            TeachingComponent.objects.filter(
-                is_active=True,
-                offering__is_active=True,
-                offering__course__is_active=True,
-                offering__semester=self.semester,
-                offering__managing_department=self.department,
-            )
+            self._components_queryset()
             .select_related(
                 "offering",
                 "offering__course",
@@ -183,7 +216,13 @@ class DepartmentProblemBuilder:
         )
 
     def _load_grid(self) -> None:
-        """Active working days and their active periods, grouped by weekday."""
+        """Active working days and their active periods, grouped by weekday.
+
+        There is one recurring weekly grid per semester, so both scopes read the
+        same working days and periods and both use the same exact-block rule:
+        adjacent periods whose durations sum *exactly* to the session length, which
+        is why a 90-minute session is never satisfied by two 60-minute periods.
+        """
         working_days = (
             WorkingDay.objects.filter(semester=self.semester, is_active=True)
             .prefetch_related(
@@ -226,7 +265,12 @@ class DepartmentProblemBuilder:
         self._slots_by_weekday = group_slots_by_weekday(grid_slots)
 
     def _load_instructor_facts(self) -> None:
-        """Availability and preference windows for every instructor of the semester."""
+        """Availability and preference windows for every instructor of the semester.
+
+        Loaded once for the whole semester, which is what keeps college scope
+        affordable: availability and preferences of every instructor are read in
+        two queries no matter how many departments the problem spans.
+        """
         availability_rows: dict[int, list[tuple[int, int, int]]] = {}
         for instructor_id, weekday, start, end in (
             InstructorAvailability.objects.filter(
@@ -274,7 +318,9 @@ class DepartmentProblemBuilder:
         """Active rooms college-wide, plus their availability windows.
 
         Rooms owned by other departments stay in the pool: the canonical Phase 5
-        suitability helper decides whether the managing department may use them.
+        suitability helper decides, per requirement, whether the managing department
+        may use them. Pool and availability are therefore loaded once per problem,
+        not once per department.
         """
         self._rooms = list(
             Room.objects.filter(is_active=True)
@@ -319,6 +365,9 @@ class DepartmentProblemBuilder:
             for assignment in assignments
             if assignment.assignment_role == AssignmentRole.PRIMARY
         ]
+
+        department_id = component.offering.managing_department_id
+        self._count_component(component)
 
         # Adapter preconditions. Phase 7 readiness normally guarantees these, so any
         # failure here means the data changed between validation and building, and
@@ -391,6 +440,7 @@ class DepartmentProblemBuilder:
         # of asking the engine a question that already has no answer.
         seen: set[tuple[str, tuple]] = set()
         for session_id in session_ids:
+            self._bump(self._department_sessions, department_id)
             session_candidate_ids: list[str] = []
             for block, room, penalty in placements:
                 candidate_id = self._candidate_id(
@@ -411,6 +461,7 @@ class DepartmentProblemBuilder:
                     continue
                 seen.add((session_id, placement_key))
                 session_candidate_ids.append(candidate_id)
+                self._bump(self._department_candidates, department_id)
                 self._candidates.append(
                     PlacementCandidate(
                         candidate_id=candidate_id,
@@ -445,12 +496,27 @@ class DepartmentProblemBuilder:
                 )
             )
 
+    def _count_component(self, component: TeachingComponent) -> None:
+        """Remember one component against its managing department, for diagnostics."""
+        department = component.offering.managing_department
+        self._department_info.setdefault(
+            department.pk,
+            DepartmentInfo(id=department.pk, code=department.code, name=department.name),
+        )
+        self._bump(self._department_components, department.pk)
+
+    @staticmethod
+    def _bump(counter: dict[int, int], key: int) -> None:
+        """Increment one per-department diagnostic counter."""
+        counter[key] = counter.get(key, 0) + 1
+
     def _component_info(
         self, component: TeachingComponent, required_minutes: int, weekly_minutes: int
     ) -> ComponentInfo:
         """Shallow, JSON-safe description of one component."""
         offering = component.offering
         course = offering.course
+        department = offering.managing_department
         return ComponentInfo(
             id=component.pk,
             component_type=component.component_type,
@@ -460,6 +526,9 @@ class DepartmentProblemBuilder:
             course=CourseInfo(id=course.pk, code=course.code, name=course.name),
             offering=OfferingInfo(
                 id=offering.pk, offering_code=offering.offering_code or ""
+            ),
+            managing_department=DepartmentInfo(
+                id=department.pk, code=department.code, name=department.name
             ),
         )
 
@@ -488,6 +557,12 @@ class DepartmentProblemBuilder:
         matching weekday. An instructor without availability for the semester
         produces no candidates at all, because absence is never unrestricted
         availability. Assistants are checked exactly like primary instructors.
+
+        Only the instructors actually assigned to the component are considered, so
+        college scope cannot widen one department's teaching rights: who may teach a
+        component stays a property of its assignment, which Phase 7 checks against
+        the component's managing department. Running the solver college-wide does not
+        turn a grant for department B into a grant for department C.
         """
         for instructor_id in instructor_ids:
             windows = self._instructor_windows.get(instructor_id, {}).get(
@@ -524,7 +599,9 @@ class DepartmentProblemBuilder:
         Results are memoised per requirement *shape*: two components with the same
         managing department, required room type, effective capacity and capability
         set get the same answer, so the expensive canonical check runs once per
-        shape rather than once per component.
+        shape rather than once per component. The shape includes the managing
+        department, so a room shared with one department is never silently reused as
+        suitable for another.
         """
         signature = ResourceFacts.requirement_signature(requirement)
         cached = self._rooms_by_signature.get(signature)
@@ -561,8 +638,10 @@ class DepartmentProblemBuilder:
     ) -> str:
         """Stable candidate identifier built only from placement facts.
 
-        The id carries no penalty, no timestamp and no random part, so repeated
-        generation against unchanged data produces identical candidate ids.
+        The id carries no penalty, no scope, no timestamp and no random part, so
+        repeated generation against unchanged data produces identical candidate ids,
+        and the same physical placement receives the same id whether it was built by
+        department generation or by college generation.
         """
         slots = "-".join(str(slot_id) for slot_id in block.slot_ids)
         return (
@@ -583,6 +662,7 @@ class DepartmentProblemBuilder:
                 details={
                     "course_code": component.offering.course.code,
                     **details,
+                    **self._issue_details(component),
                 },
             )
         )
@@ -613,7 +693,8 @@ class DepartmentProblemBuilder:
     ) -> None:
         """One session could not be given a single candidate, so no solve is possible.
 
-        Only counts are reported, never foreign resource identities.
+        Only counts and the component's own identity are reported, never a foreign
+        resource identity.
         """
         self._issues.append(
             ValidationIssue(
@@ -630,6 +711,7 @@ class DepartmentProblemBuilder:
                     "suitable_room_count": candidate_room_count,
                     "available_time_block_count": time_block_count,
                     "course_code": component.offering.course.code,
+                    **self._issue_details(component),
                 },
             )
         )
@@ -657,7 +739,90 @@ class DepartmentProblemBuilder:
             max_candidates_per_session=counts[-1].candidate_count if counts else 0,
             sessions_with_fewest_candidates=tuple(counts[:DIAGNOSTIC_SESSION_SAMPLE]),
             sessions_without_candidates=without,
+            departments=len(self._department_info),
+            department_breakdown=self._department_breakdown(),
         )
 
+    def _department_breakdown(self) -> tuple[DepartmentBuildCount, ...]:
+        """Per-managing-department build counts, sorted by department code then id.
 
-__all__ = ["DIAGNOSTIC_SESSION_SAMPLE", "DepartmentProblemBuilder"]
+        The order is documented because it is part of the response contract: a
+        college preview lists its departments in the same order on every run.
+        """
+        rows = [
+            DepartmentBuildCount(
+                department=info,
+                components=self._department_components.get(department_id, 0),
+                sessions=self._department_sessions.get(department_id, 0),
+                candidates=self._department_candidates.get(department_id, 0),
+            )
+            for department_id, info in self._department_info.items()
+        ]
+        rows.sort(key=lambda row: (row.department.code, row.department.id))
+        return tuple(rows)
+
+
+class DepartmentProblemBuilder(GenerationProblemBuilder):
+    """Builds one department's discrete scheduling problem for one semester."""
+
+    def __init__(self, *, semester, department) -> None:
+        super().__init__(semester=semester, department=department)
+
+    def _components_queryset(self):
+        """Active components managed by this department.
+
+        A component that merely shares students with the department belongs to the
+        department that manages it, so it is not demand here.
+        """
+        return TeachingComponent.objects.filter(
+            is_active=True,
+            offering__is_active=True,
+            offering__course__is_active=True,
+            offering__semester=self.semester,
+            offering__managing_department=self.department,
+        )
+
+    def _problem_name(self) -> str:
+        return f"department:{self.department.pk}:semester:{self.semester.pk}"
+
+
+class CollegeProblemBuilder(GenerationProblemBuilder):
+    """Builds one semester's college-wide discrete scheduling problem.
+
+    Every active component of every managing department becomes part of a single
+    problem, so shared instructors, shared rooms and joint student groups are
+    constrained together instead of department by department.
+    """
+
+    def __init__(self, *, semester) -> None:
+        super().__init__(semester=semester, department=None)
+
+    def _components_queryset(self):
+        """Active components of the semester across all managing departments."""
+        return TeachingComponent.objects.filter(
+            is_active=True,
+            offering__is_active=True,
+            offering__course__is_active=True,
+            offering__semester=self.semester,
+        )
+
+    def _problem_name(self) -> str:
+        return f"college:semester:{self.semester.pk}"
+
+    def _issue_details(self, component) -> dict:
+        """Name the managing department, which is ambiguous only in college scope.
+
+        The department endpoint covers exactly one department, so its issues keep
+        their existing shape and stay compatible with Phase 9.
+        """
+        return {
+            "managing_department_id": component.offering.managing_department_id,
+        }
+
+
+__all__ = [
+    "DIAGNOSTIC_SESSION_SAMPLE",
+    "CollegeProblemBuilder",
+    "DepartmentProblemBuilder",
+    "GenerationProblemBuilder",
+]

@@ -179,6 +179,7 @@ All resource APIs expose the same five operations — `GET` list, `GET` detail,
 | Calendar exceptions       | `/api/calendar-exceptions/`        | scope-dependent (see the calendar section) |
 | Scheduling validation     | `POST /api/scheduling/validate/`   | see the validation section below       |
 | Department generation     | `POST /api/scheduling/generate/`   | own department (college admin: any)    |
+| College generation        | `POST /api/scheduling/generate-college/` | college administrator or superuser only |
 
 Write ownership in this table is stricter than read visibility for shared
 resources: shared instructors and rooms are readable by the departments they are
@@ -966,8 +967,8 @@ POST /api/scheduling/generate/
 
 Builds the department's weekly scheduling problem from stored data, solves it with
 CP-SAT and returns the resulting timetable **preview**. Only the department scope
-exists in this phase: there is no `scope` field, and college-wide generation is
-Phase 10.
+exists on this endpoint: there is no `scope` field, and the college-wide solver is a
+separate endpoint, `POST /api/scheduling/generate-college/`.
 
 `semester` and `department` are required; `max_time_seconds` is optional and
 defaults to 30 (accepted range 1–120). The caller cannot control the search seed,
@@ -1129,11 +1130,11 @@ foreign identities.
 scheduling/services/generation/
 ├── blocks.py       # exact contiguous slot-block arithmetic (pure)
 ├── preferences.py  # preference windows and penalty constants (pure)
-├── candidates.py   # Django adapter: sessions, candidates, diagnostics, room grid
+├── candidates.py   # shared Django adapter + department and college scopes
 ├── domain.py       # bundle, diagnostics, preview and outcome value objects
 ├── issues.py       # stable generation issue codes
-├── preview.py      # placements to flat preview rows
-└── service.py      # validate -> build -> solve -> preview
+├── preview.py      # placements to flat preview rows (+ college ordering)
+└── service.py      # shared validate -> build -> solve -> preview pipeline
 ```
 
 The pipeline reads its data once with `select_related`/`prefetch_related` - the
@@ -1146,6 +1147,178 @@ N+1 fix stays fixed.
 
 Phase 8's `scheduling.services.solver` package remains pure and never imports this
 adapter.
+
+The department and college scopes are built by one implementation, not two:
+`GenerationProblemBuilder` holds every decision (sessions, exact blocks, instructor
+and room eligibility, penalties, session and candidate identity) and the two
+subclasses only choose which components are demand. Phase 10 therefore cannot
+schedule a room, an instructor or a group by a rule that differs from Phase 9's.
+
+## College-wide schedule generation
+
+```
+POST /api/scheduling/generate-college/
+```
+
+```json
+{ "semester": 3, "max_time_seconds": 60 }
+```
+
+Builds **one** scheduling problem covering every active teaching component of the
+semester in every managing department, solves it once with CP-SAT and returns the
+college-wide preview. The scope is the endpoint itself: there is no `scope` field
+and no `department` field, so a request cannot turn this endpoint into a
+department run or the department endpoint into a college run.
+
+`semester` is required; `max_time_seconds` is optional and defaults to 60 (accepted
+range 1–300, wider than the department endpoint because a college-wide problem is
+larger). The search seed, the single search worker and the solver log stay fixed
+server-side. `random_seed`, `num_search_workers`, `log_search_progress` and
+`reservations` are not accepted through this API; unknown fields are ignored, as
+elsewhere in the API.
+
+### Authorization
+
+Only `COLLEGE_ADMIN` and Django superusers may call it. `DEPARTMENT_ADMIN`,
+`SCHEDULER`, `VIEWER` and `INSTRUCTOR` are refused with `403` whatever their
+department is, and anonymous callers get `401`. The gate is the same
+cross-department property Phase 7 uses for college-wide validation, so the two
+endpoints cannot disagree about who is a college administrator.
+
+College administrator authority schedules *more sessions at once*; it does not widen
+any academic rule. The builder still enforces each component's own managing-department
+eligibility: an instructor or a room shared with department B is a candidate for
+B-managed components only, never for C-managed ones.
+
+### The validation gate
+
+The Phase 7 validator service runs with `scope = COLLEGE` (never through HTTP). When
+the scope is not ready the request stops with `409`, OR-Tools is never called, and the
+Phase 7 result is returned inline:
+
+```json
+{
+  "generated": false,
+  "persisted": false,
+  "scope": "COLLEGE",
+  "reason": "PRE_SCHEDULING_VALIDATION_FAILED",
+  "validation": { "ready": false, "summary": {}, "issues": [] }
+}
+```
+
+Warnings never block generation. The second `409` reason is
+`CANDIDATE_BUILD_FAILED`, returned when at least one session has no candidate at
+all; it carries `NO_PLACEMENT_CANDIDATES` issues naming the session, the component,
+the managing department and the required duration in minutes, and it also never
+calls the engine.
+
+### Component population
+
+Every active `TeachingComponent` whose offering is active, whose course is active
+and whose offering belongs to the requested semester is demand, across all managing
+departments. The managing department stays
+`component.offering.managing_department`.
+
+A joint course is **one** component with **one** set of weekly sessions. Its
+candidates carry every attached student group, including groups of other
+departments, so a shared group is constrained globally instead of being copied per
+participating department. The same rule applies to offerings that several
+departments attend: no per-department duplication, no merged solutions.
+
+### One global problem, not per-department solutions
+
+All sessions of all departments go into a single `SolverProblem`, and the Phase 8
+engine enforces the resource conflicts on it. This is the point of the phase:
+
+- **Shared instructors.** An instructor owned by A and shared with B may teach an
+  A-managed and a B-managed component in the same semester; the college-wide solve
+  can never place those two sessions in overlapping periods.
+- **Shared rooms.** A room usable by both A and B is never assigned to two sessions
+  at the same time, even though each department would have been individually valid.
+- **Joint student groups.** A group that attends an A-managed joint component and a
+  B-managed component of its own is never booked into both at once.
+- **Component self-conflict** stays with the engine: a component's own weekly
+  sessions never overlap each other.
+
+Solving each department separately and merging the answers cannot see any of these
+collisions, so it is deliberately not what happens here.
+
+### Identity is shared with Phase 9
+
+Sessions keep the `component:<id>:session:<ordinal>` convention, and candidate ids
+are built only from physical placement facts (component, ordinal, weekday, slot ids,
+room) — no penalty, no timestamp, no scope. The same physical placement therefore
+receives the same candidate id whether it was produced by department or by
+college generation.
+
+### Preferences and objective
+
+The soft objective is still the sum of candidate-local instructor preference
+penalties, with the Phase 9 constants unchanged (`PREFERRED = 0`, `NEUTRAL = 5`,
+`AVOID = 20`). Phase 10 adds no gap minimisation, session spreading, daily balance,
+theory/practical ordering, first/last-period avoidance, fairness or room-utilisation
+term. Preference windows never affect feasibility.
+
+### Preview and diagnostics
+
+A successful response carries `generated`, `persisted`, `scope`, the semester, the
+validation summary, the solver block, `summary` counts
+(`departments`, `components`, `sessions`, `candidates`, `placements`),
+`department_summaries` and `placements`.
+
+Each placement is flat and shallow — session, course, offering, teaching component,
+**managing department**, weekday with display label, occupied periods, derived
+`start_time`/`end_time`, room, instructors with their assignment role, all student
+groups and the candidate penalty. A joint placement appears once in `placements`,
+belonging to the department that manages its component; participating departments
+can be derived from its student groups later. The department endpoint's placement
+body is unchanged.
+
+`department_summaries` reports `components`, `sessions`, `candidates` and
+`placements` per managing department, where `placements` counts components managed
+by that department, so a joint placement is never counted for a department that
+merely attends it. `diagnostics` adds `departments` and a `department_breakdown` to
+the Phase 9 counts (components, sessions, candidates, minimum/maximum candidates per
+session, the sessions with the fewest candidates and the sessions without any).
+Both lists are ordered by department code, then department id. Diagnostics remain
+counts, never a proven root cause.
+
+Ordering is deterministic: placements are sorted by managing department code,
+weekday, first period start, course code, component id and session ordinal, and the
+engine's own order is deterministic too (fixed seed, one worker). Repeated college
+generation against unchanged data returns identical session ids, candidate ids,
+penalties, placements, ordering and department summaries.
+
+### Queries
+
+College scope does not query per department. The grid, instructor availability and
+preferences, the room pool with capabilities and grants, and room availability are
+loaded once per problem; component-level suitability reuses the memoised canonical
+Phase 5 helper. Adding a third department therefore adds no resource queries.
+
+### Empty semester
+
+A semester that Phase 7 considers ready but that has no active component at all
+produces `generated: true`, `persisted: false`, `solver.status: "OPTIMAL"` with zero
+placements and zero counts. Nothing crashes, and the absence of a timetable is
+reported as an empty timetable rather than as an error.
+
+### No persistence
+
+No `Schedule`, `ScheduleVersion` or `ScheduleEntry` model exists, no migration was
+added, and calling the endpoint changes nothing: no academic, resource or calendar
+row is created or modified. `"persisted": false` is always returned. Persistence and
+versioning arrive in Phase 11.
+
+### Not in Phase 10
+
+- no persistence, versioning, approval or publication;
+- no manual editing or change requests;
+- no reservations: `reservations` stays empty, and clients cannot supply them;
+- no calendar-exception subtraction from the recurring weekly grid, matching Phases
+  7 and 9;
+- no new soft constraints beyond instructor preference penalties;
+- no reports or Excel/PDF export, no background jobs, no Railway configuration.
 
 ## Who may write what
 
@@ -1230,9 +1403,13 @@ not used.
 - **Phase 9 (done)** — the department scheduler: the Django problem builder,
   session expansion, exact slot blocks, preference penalties and the preview
   endpoint. Preview only, nothing persisted.
-- **Phase 10 (planned)** — college-wide generation across managing departments.
-- **Later** — `Schedule`/`ScheduleVersion`/`ScheduleEntry` persistence and
-  versioning, approval and publication, manual editing, reports/export,
+- **Phase 10 (done)** — college-wide generation: one CP-SAT problem covering every
+  department of the semester, with shared instructors, shared rooms and joint
+  student groups constrained globally. College administrators only, preview only.
+- **Phase 11 (planned)** — `Schedule`/`ScheduleVersion`/`ScheduleEntry` persistence
+  and versioning.
+- **Later** — approval and publication, manual editing, reports/export,
+  reservations and department regeneration from an authoritative version,
   PostgreSQL, background jobs, Railway deployment.
 - **Flutter instructor app** — after the web application, using
   `/api/me/teaching-assignments/` as one of its first endpoints.

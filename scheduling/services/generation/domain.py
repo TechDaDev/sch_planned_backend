@@ -38,8 +38,26 @@ class OfferingInfo:
 
 
 @dataclass(frozen=True)
+class DepartmentInfo:
+    """Shallow department summary.
+
+    ``id``/``code``/``name`` mirror the API summary shape, so a preview can name
+    the department that manages a component without another query.
+    """
+
+    id: int
+    code: str
+    name: str
+
+
+@dataclass(frozen=True)
 class ComponentInfo:
-    """Shallow teaching-component summary, plus what it needs from the grid."""
+    """Shallow teaching-component summary, plus what it needs from the grid.
+
+    ``managing_department`` is the department that owns the offering, which is
+    also the department every resource-sharing decision is measured against. It
+    stays optional so a bundle built before Phase 10 keeps working.
+    """
 
     id: int
     component_type: str
@@ -48,6 +66,7 @@ class ComponentInfo:
     weekly_minutes: int
     course: CourseInfo
     offering: OfferingInfo
+    managing_department: DepartmentInfo | None = None
 
 
 @dataclass(frozen=True)
@@ -117,8 +136,40 @@ class SessionCandidateCount:
 
 
 @dataclass(frozen=True)
+class DepartmentBuildCount:
+    """How much of the built problem one managing department contributed.
+
+    A diagnostic count only: it says what was built, never why a timetable could
+    not be found.
+    """
+
+    department: DepartmentInfo
+    components: int
+    sessions: int
+    candidates: int
+
+    def as_dict(self) -> dict[str, Any]:
+        """Plain, JSON-serializable representation."""
+        return {
+            "department": {
+                "id": self.department.id,
+                "code": self.department.code,
+                "name": self.department.name,
+            },
+            "components": self.components,
+            "sessions": self.sessions,
+            "candidates": self.candidates,
+        }
+
+
+@dataclass(frozen=True)
 class GenerationDiagnostics:
-    """Counts gathered while building, never presented as a root cause."""
+    """Counts gathered while building, never presented as a root cause.
+
+    ``departments`` and ``department_breakdown`` are additive Phase 10 fields: a
+    single-department build reports the one department it covered, so the same
+    shape describes both scopes.
+    """
 
     components: int
     sessions: int
@@ -127,6 +178,8 @@ class GenerationDiagnostics:
     max_candidates_per_session: int
     sessions_with_fewest_candidates: tuple[SessionCandidateCount, ...]
     sessions_without_candidates: tuple[str, ...]
+    departments: int = 0
+    department_breakdown: tuple[DepartmentBuildCount, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         """Plain, JSON-serializable representation."""
@@ -145,6 +198,10 @@ class GenerationDiagnostics:
                 for item in self.sessions_with_fewest_candidates
             ],
             "sessions_without_candidates": list(self.sessions_without_candidates),
+            "departments": self.departments,
+            "department_breakdown": [
+                item.as_dict() for item in self.department_breakdown
+            ],
         }
 
 
@@ -171,7 +228,7 @@ class ProblemBundle:
 
 @dataclass(frozen=True)
 class GenerationSummary:
-    """Success summary counts."""
+    """Success summary counts of one department's generation."""
 
     components: int
     sessions: int
@@ -180,6 +237,61 @@ class GenerationSummary:
 
     def as_dict(self) -> dict[str, int]:
         return {
+            "components": self.components,
+            "sessions": self.sessions,
+            "candidates": self.candidates,
+            "placements": self.placements,
+        }
+
+
+@dataclass(frozen=True)
+class CollegeGenerationSummary:
+    """Success summary counts of a college-wide generation.
+
+    ``departments`` is the number of managing departments the build covered, and
+    ``placements`` is the number of sessions the engine placed; a placement is
+    counted once even when several departments attend it.
+    """
+
+    departments: int
+    components: int
+    sessions: int
+    candidates: int
+    placements: int
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "departments": self.departments,
+            "components": self.components,
+            "sessions": self.sessions,
+            "candidates": self.candidates,
+            "placements": self.placements,
+        }
+
+
+@dataclass(frozen=True)
+class DepartmentGenerationSummary:
+    """One managing department's share of a college-wide generation.
+
+    ``placements`` counts the components that department manages, so a joint
+    component serving foreign student groups is counted once, for its managing
+    department, and never for the departments that merely attend it.
+    """
+
+    department: DepartmentInfo
+    components: int
+    sessions: int
+    candidates: int
+    placements: int
+
+    def as_dict(self) -> dict[str, Any]:
+        """Plain, JSON-serializable representation."""
+        return {
+            "department": {
+                "id": self.department.id,
+                "code": self.department.code,
+                "name": self.department.name,
+            },
             "components": self.components,
             "sessions": self.sessions,
             "candidates": self.candidates,
@@ -204,6 +316,7 @@ class PreviewPlacement:
     instructors: tuple[PlacementInstructor, ...]
     student_groups: tuple[GroupInfo, ...]
     penalty: int
+    managing_department: DepartmentInfo | None = None
     raw: ScheduledPlacement | None = None
 
     def as_dict(self) -> dict[str, Any]:
@@ -249,6 +362,15 @@ class PreviewPlacement:
                 for group in self.student_groups
             ],
             "penalty": self.penalty,
+            "managing_department": (
+                None
+                if self.managing_department is None
+                else {
+                    "id": self.managing_department.id,
+                    "code": self.managing_department.code,
+                    "name": self.managing_department.name,
+                }
+            ),
         }
 
 
@@ -260,6 +382,10 @@ class GenerationOutcome:
     gate refused the scope, or no candidate could be built for some session. All
     other outcomes, including an infeasible or timed-out solve, are a normal ``200``
     because the request itself was valid.
+
+    ``scope`` names the validation/scheduling scope the request ran under and is
+    ``None`` for the Phase 9 department endpoint, whose response has no scope
+    field. ``department`` is ``None`` for a college-wide run.
     """
 
     generated: bool = False
@@ -269,17 +395,23 @@ class GenerationOutcome:
     message: str = ""
     semester: Any = None
     department: Any = None
+    scope: str | None = None
     validation: Any = None
     solver: SolverResult | None = None
-    summary: GenerationSummary | None = None
+    summary: Any = None
     placements: tuple[PreviewPlacement, ...] = ()
+    department_summaries: tuple[DepartmentGenerationSummary, ...] = ()
     generation_issues: tuple[Any, ...] = ()
     diagnostics: GenerationDiagnostics | None = None
 
 
 __all__ = [
+    "CollegeGenerationSummary",
     "ComponentInfo",
     "CourseInfo",
+    "DepartmentBuildCount",
+    "DepartmentGenerationSummary",
+    "DepartmentInfo",
     "GenerationDiagnostics",
     "GenerationOutcome",
     "GenerationSummary",
