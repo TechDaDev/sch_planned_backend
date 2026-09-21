@@ -646,6 +646,12 @@ class CollegeScheduleGenerationInputSerializer(serializers.Serializer):
 
     A college-wide problem contains every department's sessions at once, so the
     accepted time limit is wider than the department endpoint's.
+
+    Unlike the rest of the API, this body rejects unknown fields instead of
+    ignoring them: a silently ignored ``scope`` or ``department`` would let a caller
+    believe a hidden scope was honoured, and a silently ignored ``random_seed``,
+    ``num_search_workers``, ``log_search_progress`` or ``reservations`` would look
+    like a supported solver control. Rejection makes the contract explicit.
     """
 
     semester = serializers.PrimaryKeyRelatedField(queryset=Semester.objects.all())
@@ -660,6 +666,24 @@ class CollegeScheduleGenerationInputSerializer(serializers.Serializer):
             "normal."
         ),
     )
+
+    def to_internal_value(self, data):
+        """Reject any field this endpoint does not define.
+
+        ``department`` and ``scope`` matter most: both would imply a scope the
+        endpoint does not have. Solver controls do not exist either, because the
+        engine options are fixed for reproducibility.
+        """
+        if hasattr(data, "keys"):
+            unknown = sorted(set(data.keys()) - set(self.fields))
+            if unknown:
+                raise serializers.ValidationError(
+                    {
+                        field: "This endpoint does not accept this field."
+                        for field in unknown
+                    }
+                )
+        return super().to_internal_value(data)
 
 
 class GenerationDepartmentBuildCountSerializer(serializers.Serializer):

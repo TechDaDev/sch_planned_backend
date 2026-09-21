@@ -1173,9 +1173,14 @@ department run or the department endpoint into a college run.
 `semester` is required; `max_time_seconds` is optional and defaults to 60 (accepted
 range 1–300, wider than the department endpoint because a college-wide problem is
 larger). The search seed, the single search worker and the solver log stay fixed
-server-side. `random_seed`, `num_search_workers`, `log_search_progress` and
-`reservations` are not accepted through this API; unknown fields are ignored, as
-elsewhere in the API.
+server-side.
+
+This request body is validated strictly: any field the endpoint does not define is
+rejected with `400`. `department` and `scope` are therefore refused rather than
+silently ignored, so no caller can believe a hidden scope was honoured, and
+`random_seed`, `num_search_workers`, `log_search_progress` and `reservations` are
+refused rather than half-supported. The rest of the API ignores unknown fields; this
+endpoint deliberately does not, because ignoring them here is a scope-confusion risk.
 
 ### Authorization
 

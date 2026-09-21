@@ -325,15 +325,19 @@ class CollegeScheduleGenerationView(APIView):
             "blocks every assigned instructor and the room are available for. "
             "Preference windows only influence the weighted objective, never "
             "feasibility, and the penalty weights are identical to the department "
-            "endpoint's."
+            "endpoint's.\n\n"
+            "The body is validated strictly: a field this endpoint does not define "
+            "- including ``department``, ``scope`` or a solver control - is "
+            "rejected with ``400`` instead of being ignored."
         ),
         request=CollegeScheduleGenerationInputSerializer,
         responses={
             200: CollegeGenerationResponseSerializer,
             400: OpenApiResponse(
                 description=(
-                    "Malformed body, unknown semester id, or a time limit outside "
-                    "the accepted range."
+                    "Malformed body, unknown semester id, a time limit outside the "
+                    "accepted range, or a field this endpoint does not define "
+                    "(``department``, ``scope`` or a solver control)."
                 )
             ),
             401: OpenApiResponse(description="Authentication required."),
