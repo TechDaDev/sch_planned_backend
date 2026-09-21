@@ -4,9 +4,10 @@ Django REST Framework backend for the College Academic Schedule Planner.
 Provides the project foundation (configuration package, domain app skeletons,
 custom user model, API/OpenAPI plumbing) that later phases build on.
 
-- Current phase: **Phase 5 — rooms, laboratories, capabilities and room
-  requirements** (no time slots, timetable generation or actual room assignment
-  yet).
+- Current phase: **Phase 6 — calendar and time configuration** (working days,
+  teaching periods, breaks and calendar exceptions). No timetable generation,
+  schedule entries or actual room/time assignment yet; pre-scheduling validation
+  is Phase 7.
 
 ## Architecture
 
@@ -48,7 +49,14 @@ sch_planner_backend/
 │   ├── views.py       # viewsets + /api/me/teaching-assignments/
 │   ├── urls.py        # /api/instructors/, /api/rooms/, ...
 │   └── migrations/    # 0001_initial, 0002_rooms_and_requirements
-├── scheduling/        # time slots and solving (empty until later phases)
+├── scheduling/        # calendar and time configuration
+│   ├── models.py      # WorkingDay, TimeSlot, BreakPeriod, CalendarException,
+│   │                  # ExceptionType, ExceptionScope
+│   ├── permissions.py # calendar-exception read visibility and write rules
+│   ├── serializers.py # read/write serializers + nested summaries
+│   ├── views.py       # viewsets for the time grid and exceptions
+│   ├── urls.py        # /api/working-days/, /api/time-slots/, ...
+│   └── migrations/    # 0001_calendar_and_time_configuration
 ├── reports/           # report exports (empty until later phases)
 ├── tests/             # pytest suite for the whole project
 ├── manage.py
@@ -61,9 +69,12 @@ sch_planner_backend/
 
 Phase 5 adds physical teaching spaces (rooms and laboratories) with sharing,
 capabilities, weekly availability and the room requirements that teaching
-components declare. Calendar/time slots, timetable generation (OR-Tools),
-actual room assignment and reports come later. The Flutter instructor app
-follows the web application.
+components declare. Phase 6 adds the college time configuration the scheduler
+will search: which weekdays each semester teaches, the teaching periods and
+breaks inside those days, and the dated exceptions (holidays, exams, closures,
+absences) that remove availability. Timetable generation (OR-Tools), schedule
+entries, actual room and time assignment, pre-scheduling validation and reports
+come later. The Flutter instructor app follows the web application.
 
 ## Requirements
 
@@ -154,6 +165,10 @@ All resource APIs expose the same five operations — `GET` list, `GET` detail,
 | Room availability         | `/api/room-availability/`          | availability's room owner department   |
 | Room requirements         | `/api/teaching-component-room-requirements/` | component's offering managing department |
 | Capability requirements   | `/api/teaching-component-capability-requirements/` | component's offering managing department |
+| Working days              | `/api/working-days/`               | college-wide (writes: college admin)   |
+| Time slots                | `/api/time-slots/`                 | college-wide (writes: college admin)   |
+| Break periods             | `/api/break-periods/`              | college-wide (writes: college admin)   |
+| Calendar exceptions       | `/api/calendar-exceptions/`        | scope-dependent (see the calendar section) |
 
 Write ownership in this table is stricter than read visibility for shared
 resources: shared instructors and rooms are readable by the departments they are
@@ -162,8 +177,9 @@ departments, but writes always stay with the owning department. Simple
 exact-match query filters are available on the resource endpoints
 (`primary_department`, `owner_department`, `room_type`, `sharing_scope`,
 `instructor`, `room`, `semester`, `day_of_week`, `preference_type`,
-`capability`, `assignment_role`, `is_active`); invalid filter values answer
-`400`.
+`capability`, `assignment_role`, `is_active`, `working_day`, `date`,
+`exception_type`, `scope_type`, `department`, `student_group`); invalid filter
+values answer `400`.
 
 `DELETE` is intentionally not part of the API: the detail routes exist but
 answer **405 Method Not Allowed**. Lifecycle is managed with `is_active`.
@@ -505,13 +521,96 @@ requirements only; the room a session finally uses belongs to future
 timetable/schedule entries, and room double-booking detection arrives with that
 scheduling layer.
 
+## Calendar and time configuration
+
+The time grid describes when a semester may teach at all. A working day gives one
+schedulable weekday of a semester with its opening hours, time slots are the
+teaching periods inside it, and breaks carve out the gaps (morning break, lunch,
+prayer). Weekdays reuse the shared `academics.Weekday` numbering
+(Sunday = 0 … Thursday = 4); Friday and Saturday are not ordinary working days
+in this version, and nothing assumes all five weekdays exist — each semester is
+configured explicitly.
+
+```
+Semester ──< WorkingDay (one per weekday) ──< TimeSlot   (sequence 1, 2, 3, ...)
+                                          └─< BreakPeriod (named gaps)
+Semester ──< CalendarException (dated removals, scoped)
+```
+
+| Resource | Notable fields |
+| --- | --- |
+| Working day | `semester`, `day_of_week` (+ `day_of_week_code`, `day_of_week_display`), `start_time`, `end_time`, `is_active` |
+| Time slot | `working_day`, `sequence`, `label`, `start_time`, `end_time`, `duration_minutes` (derived), `is_active` |
+| Break period | `working_day`, `name`, `start_time`, `end_time`, `is_active` |
+| Calendar exception | `semester`, `date`, `exception_type`, `scope_type`, `target` (derived), `title`, `description`, `start_time`, `end_time`, `is_full_day` (derived), `is_active` |
+
+`day_of_week` is exposed as the shared integer plus a stable `day_of_week_code`
+(`SUNDAY`) for clients that prefer names. `duration_minutes` and `is_full_day`
+are computed at read time and never stored.
+
+### Grid consistency rules
+
+A working day must end after it starts, and one weekday may appear only once per
+semester. Narrowing a working day must not silently invalidate what already
+exists: if an active time slot or break would fall outside the new window, the
+update is rejected with `400` and the offending rows are named. A time slot must
+fit inside its working day and follow a positive `sequence` that is unique
+within the day, and slots and breaks may not overlap each other in either
+direction — creating a break over an existing slot fails exactly like creating a
+slot over an existing break. Inactive rows neither conflict nor block, so the
+grid can be reshaped before it is switched on.
+
+### Calendar exceptions
+
+An exception removes availability on one date. `exception_type` says what it is
+(`HOLIDAY`, `EXAM`, `EVENT`, `MAINTENANCE`, `INSTRUCTOR_ABSENCE`,
+`ROOM_CLOSURE`) and `scope_type` says what it affects:
+
+| Scope | Target field | Owning department |
+| --- | --- | --- |
+| `COLLEGE` | none | college-wide |
+| `DEPARTMENT` | `department` | the department |
+| `INSTRUCTOR` | `instructor` | `instructor.primary_department` |
+| `ROOM` | `room` | `room.owner_department` |
+| `STUDENT_GROUP` | `student_group` | `student_group.stage.program.department` |
+
+Exactly the target matching the scope must be set, and no second target may be
+sent. `INSTRUCTOR_ABSENCE` is pinned to the instructor scope and `ROOM_CLOSURE`
+to the room scope. Omitting both times makes a full-day exception; supplying one
+without the other, or an end before the start, answers `400`. When the semester
+has published dates, the exception date must fall inside them.
+
+The read shape returns the exception, not the whole resource graph: `target`
+carries the single summary matching the scope (`null` for college-wide) plus the
+derived `is_full_day` flag.
+
+### What a department can see
+
+College-wide and own-department exceptions are visible to a department, along
+with instructor exceptions for instructors shared with it, room exceptions for
+rooms it may use, and group exceptions for its own groups. A joint course alone
+does not expose another department's absence or closure records, and a user
+without a department sees no exceptions at all. Writes need a college
+administrator, or a department administrator acting on a resource its own
+department owns — a department administrator cannot create a college-wide
+exception, and cannot move an owned exception onto a foreign instructor, room or
+group.
+
+### The grid is configuration, not assignment
+
+Working days, time slots and breaks say *when teaching is possible*, never *who
+teaches what where*. Nothing in this phase attaches a teaching component,
+instructor, room or student group to a slot, and no double-booking is prevented
+— that belongs to schedule entries and the pre-scheduling validator in later
+phases.
+
 ## Who may write what
 
 | Role | Reads | Writes |
 | --- | --- | --- |
-| `COLLEGE_ADMIN` or Django superuser | everything | everything: colleges, academic years, semesters, joint-course group associations, instructor profiles, sharing grants, availability, preferences, assignments, room types, room capabilities, rooms, room grants, room capabilities and availability, and teaching-component room requirements |
-| `DEPARTMENT_ADMIN` | own department plus joint components their students attend, instructors shared with them, and rooms they may use | own department: update it; manage programs, stages, groups, courses, offerings, components, component/group links (own groups only), instructor profiles, sharing grants, availability, preferences, assignments on components their department manages, own rooms with their grants, capabilities and availability, and room requirements for components their department manages |
-| `SCHEDULER`, `VIEWER`, `INSTRUCTOR` | own department plus joint components their students attend, instructors shared with them, and rooms they may use | none — every Phase 2–5 resource is read-only for these roles |
+| `COLLEGE_ADMIN` or Django superuser | everything | everything: colleges, academic years, semesters, joint-course group associations, instructor profiles, sharing grants, availability, preferences, assignments, room types, room capabilities, rooms, room grants, room capabilities and availability, teaching-component room requirements, working days, time slots, breaks and calendar exceptions |
+| `DEPARTMENT_ADMIN` | own department plus joint components their students attend, instructors shared with them, rooms they may use, and calendar exceptions in their scope | own department: update it; manage programs, stages, groups, courses, offerings, components, component/group links (own groups only), instructor profiles, sharing grants, availability, preferences, assignments on components their department manages, own rooms with their grants, capabilities and availability, room requirements for components their department manages, and calendar exceptions for own-department resources |
+| `SCHEDULER`, `VIEWER`, `INSTRUCTOR` | own department plus joint components their students attend, instructors shared with them, rooms they may use, and the calendar grid and exceptions in their scope | none — every Phase 2–6 resource is read-only for these roles |
 
 A department can never modify a shared instructor or room, inspect availability
 that is not shared with it, grant itself access to a foreign instructor or room,
@@ -566,21 +665,22 @@ not used.
 ## Roadmap
 
 - **Phase 1 (done)** — roles, reusable role/department permissions, JWT login
-  and refreshdone)** — instructors: `InstructorProfile`, sharing scopes and
+  and refresh, and `/api/me/`.
+- **Phase 2 (done)** — academic structure: colleges, academic years, semesters,
+  departments, study programs, stages and student groups.
+- **Phase 3 (done)** — courses, offerings, teaching components and the group
+  links that model practical subgroups and joint inter-department courses.
+- **Phase 4 (done)** — instructors: `InstructorProfile`, sharing scopes and
   `InstructorDepartmentAccess`, weekly availability, soft preferences, workload
   limits, `TeachingAssignment` (`PRIMARY`/`ASSISTANT`) and
   `/api/me/teaching-assignments/`.
-- **Phase 5 (planned)** — rooms and laboratories, room capabilities and room
-  assignment.
-- **Later** — calendar/time slots and timetable generation (OR-Tools),
-  reports/export, PostgreSQL, background jobs, Railway deployment.
+- **Phase 5 (done)** — rooms and laboratories, room capabilities, sharing and
+  availability, and the room/capability requirements teaching components declare.
+- **Phase 6 (done)** — calendar and time configuration: working days, teaching
+  periods, breaks and dated calendar exceptions.
+- **Phase 7 (planned)** — pre-scheduling validation.
+- **Later** — timetable generation (OR-Tools), schedule entries, actual room and
+  time assignment, reports/export, PostgreSQL, background jobs, Railway
+  deployment.
 - **Flutter instructor app** — after the web application, using
-  `/api/me/teaching-assignments/` as one of its first endpointsactical subgroups and joint inter-department
-  courses.
-- **Phase 4 (planned)** — instructors: `InstructorProfile`,
-  `InstructorDepartmentAccess`, availability and preferences, and instructor
-  assignment to teaching components.
-- **Phase 5 (planned)** — rooms and laboratories, room requirements and
-  assignment.
-- **Later** — timetable generation (OR-Tools), reports/export, PostgreSQL,
-  background jobs, deployment.
+  `/api/me/teaching-assignments/` as one of its first endpoints.

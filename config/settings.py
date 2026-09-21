@@ -230,5 +230,12 @@ SPECTACULAR_SETTINGS = {
                 "availability and teaching-component room requirements."
             ),
         },
+        {
+            "name": "calendar",
+            "description": (
+                "Time configuration: working days, teaching periods, breaks and "
+                "dated calendar exceptions."
+            ),
+        },
     ],
 }

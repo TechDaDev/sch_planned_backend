@@ -67,14 +67,14 @@ def _owner_sharing_q(
     )
 
 
-def _instructor_sharing_q(prefix: str, department) -> models.Q:
+def instructor_sharing_q(prefix: str, department) -> models.Q:
     """Instructors effectively shared with ``department``."""
     return _owner_sharing_q(
         prefix, department, owner_field="primary_department"
     )
 
 
-def _room_sharing_q(prefix: str, department) -> models.Q:
+def room_sharing_q(prefix: str, department) -> models.Q:
     """Rooms effectively shared with ``department``."""
     return _owner_sharing_q(prefix, department, owner_field="owner_department")
 
@@ -86,7 +86,7 @@ def visible_instructors_filter(user) -> models.Q:
         return _never("")
     department_id = department.pk
     return (
-        _instructor_sharing_q("", department)
+        instructor_sharing_q("", department)
         | models.Q(
             teaching_assignments__is_active=True,
             teaching_assignments__teaching_component__offering__managing_department_id=department_id,
@@ -114,7 +114,7 @@ def visible_instructor_access_filter(user) -> models.Q:
 
 def visible_instructor_windows_filter(user) -> models.Q:
     """Availability/preference rows of instructors the department may schedule."""
-    return _instructor_sharing_q("instructor__", user.department)
+    return instructor_sharing_q("instructor__", user.department)
 
 
 def visible_availability_filter(user) -> models.Q:
@@ -142,7 +142,7 @@ def visible_assignments_filter(user) -> models.Q:
 
 def visible_rooms_filter(user) -> models.Q:
     """Rooms the user's department owns or may use."""
-    return _room_sharing_q("", user.department)
+    return room_sharing_q("", user.department)
 
 
 def visible_room_access_filter(user) -> models.Q:
@@ -161,12 +161,12 @@ def visible_room_access_filter(user) -> models.Q:
 
 def visible_room_capability_assignments_filter(user) -> models.Q:
     """Capability assignments on rooms the department owns or may use."""
-    return _room_sharing_q("room__", user.department)
+    return room_sharing_q("room__", user.department)
 
 
 def visible_room_availability_filter(user) -> models.Q:
     """Availability of rooms the department owns or may use."""
-    return _room_sharing_q("room__", user.department)
+    return room_sharing_q("room__", user.department)
 
 
 def visible_room_requirements_filter(user) -> models.Q:
@@ -196,6 +196,8 @@ def visible_capability_requirements_filter(user) -> models.Q:
 
 
 __all__ = [
+    "instructor_sharing_q",
+    "room_sharing_q",
     "visible_assignments_filter",
     "visible_availability_filter",
     "visible_capability_requirements_filter",

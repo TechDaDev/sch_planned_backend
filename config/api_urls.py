@@ -15,6 +15,7 @@ urlpatterns = [
     path("", include("accounts.urls")),
     path("", include("academics.urls")),
     path("", include("resources.urls")),
+    path("", include("scheduling.urls")),
     # OpenAPI schema and Swagger UI.
     path("schema/", SpectacularAPIView.as_view(), name="api-schema"),
     path(
