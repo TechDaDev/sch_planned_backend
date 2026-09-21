@@ -4,10 +4,9 @@ Django REST Framework backend for the College Academic Schedule Planner.
 Provides the project foundation (configuration package, domain app skeletons,
 custom user model, API/OpenAPI plumbing) that later phases build on.
 
-- Current phase: **Phase 7 — pre-scheduling validation** (a computed readiness
-  report over the academic, resource and calendar data). Timetable generation,
-  OR-Tools, schedule entries and actual room/time assignment are **not**
-  implemented yet; they are Phase 8.
+- Current phase: **Phase 8 — CP-SAT scheduling engine** (a reusable solver core for
+  already prepared discrete problems). No scheduling API, no `Schedule` models, no
+  persistence and no Django problem builder yet; those are Phase 9.
 
 ## Architecture
 
@@ -49,11 +48,12 @@ sch_planner_backend/
 │   ├── views.py       # viewsets + /api/me/teaching-assignments/
 │   ├── urls.py        # /api/instructors/, /api/rooms/, ...
 │   └── migrations/    # 0001_initial, 0002_rooms_and_requirements
-├── scheduling/        # calendar, time configuration and validation
+├── scheduling/        # calendar, time configuration, validation and solver
 │   ├── models.py      # WorkingDay, TimeSlot, BreakPeriod, CalendarException,
 │   │                  # ExceptionType, ExceptionScope
 │   ├── services/      # domain logic kept out of the views
-│   │   └── validation/# issues, time_grid, resources, validator
+│   │   ├── validation/# issues, time_grid, resources, validator
+│   │   └── solver/    # domain, validator, model_builder, solver, result
 │   ├── permissions.py # calendar visibility and validation scope rules
 │   ├── serializers.py # read/write serializers + validation contract
 │   ├── views.py       # time-grid viewsets + the validation endpoint
@@ -76,9 +76,10 @@ will search: which weekdays each semester teaches, the teaching periods and
 breaks inside those days, and the dated exceptions (holidays, exams, closures,
 absences) that remove availability. Phase 7 adds a computed pre-scheduling
 validator that reports whether the stored data is ready for timetable
-generation. Timetable generation (OR-Tools), schedule entries, actual room and
-time assignment and reports come later; none of them exist yet. The Flutter
-instructor app follows the web application.
+generation. Phase 8 adds the generic CP-SAT engine that turns a prepared discrete
+problem into a conflict-free assignment. A scheduling API, `Schedule` models,
+persistence and the Django problem builder do not exist yet; they are Phase 9.
+Reports and the Flutter instructor app follow later.
 
 ## Requirements
 
@@ -799,6 +800,152 @@ requirements and capabilities, rooms with capabilities and grants, availability
 rows) and then works in memory, memoising the canonical helper calls that would
 otherwise repeat per component.
 
+## CP-SAT scheduling engine
+
+The engine turns an **already prepared discrete problem** into a conflict-free
+assignment. It is a library, not a service: it imports neither Django nor DRF, and
+it is usable without a database, a request or a serializer.
+
+It deliberately does **not** decide which instructor is eligible, which room meets
+a requirement, which slots fall inside an availability window, which groups belong
+to a course, or whether Phase 7 validation is happy. Deriving feasible placements
+needs the academic and resource data, and that adapter belongs to Phase 9.
+The engine only chooses between the options it is given.
+
+- **Solver:** OR-Tools `9.15.6755` (pinned in `requirements.txt`), CP-SAT via
+  `from ortools.sat.python import cp_model`. Not the legacy CP solver.
+- **No cost:** OR-Tools does not require the database, so the engine's unit tests
+  run without a Django database fixture.
+
+### Architecture
+
+```
+scheduling/services/solver/
+├── errors.py         # SolverError, SolverInputError
+├── domain.py         # SessionDemand, PlacementCandidate, ResourceReservation,
+│                     # SolverProblem, SolverOptions
+├── validator.py      # input validation + deterministic indexes
+├── model_builder.py  # CP-SAT variables, buckets, objective
+├── solver.py         # solve entry point + status mapping
+└── result.py         # SolverStatus, ScheduledPlacement, SolverResult
+```
+
+`scheduling.services.__init__` resolves the Phase 7 validator symbols lazily, so
+`from scheduling.services.solver import solve` does not drag Django into the import
+path.
+
+### Input objects
+
+| Object | Meaning |
+| --- | --- |
+| `SessionDemand` | One required weekly session: `session_id`, `component_id`, `ordinal`, optional declared `candidate_ids` |
+| `PlacementCandidate` | One indivisible option: `day_of_week`, ordered `slot_ids`, `room_id`, `instructor_ids`, `student_group_ids`, `penalty`, `metadata` |
+| `ResourceReservation` | Occupancy that already exists: `slot_ids` plus `room_ids` / `instructor_ids` / `student_group_ids` |
+| `SolverProblem` | `sessions` + `candidates` + `reservations` (+ optional `name`) |
+| `SolverOptions` | `max_time_seconds`, `random_seed`, `num_search_workers`, `log_search_progress` |
+
+A component with `weekly_hours = 4` and `session_duration = 2` becomes two
+demands, for example `component-15/session-1` and `component-15/session-2`. The
+engine receives them; it does not derive them from teaching components.
+
+A candidate is **one decision**. A two-period session carries
+`slot_ids = (41, 42)` as a single option, never as two independent decisions, so
+the solver can never place half a session.
+
+`slot_ids` are globally unique teaching-period identifiers, so a slot id already
+implies its weekday. Conflict buckets are keyed by slot id alone.
+
+### Hard constraints
+
+- **Exactly one placement per session.** `AddExactlyOne` over a session's
+  candidates. There is no dropping: a session the engine cannot place makes the
+  problem `INFEASIBLE`.
+- **Instructor** - no instructor, primary or assistant, occupies a slot twice.
+  Every instructor id on a candidate is treated the same way.
+- **Student group** - no group occupies a slot twice, covering normal groups,
+  subgroups, joint-course groups and several groups on one candidate.
+- **Room** - no room hosts two selected candidates in the same slot.
+- **Component** - sessions of one component must not overlap, enforced explicitly
+  as a defensive invariant even though shared groups or instructors usually imply
+  it.
+- **Reservations** - a candidate touching a reserved resource/slot pair is forced
+  to 0. A reservation that names no resource closes its slots entirely. Both
+  directions support multi-slot reservations.
+
+Multi-slot sessions are compared on every slot they occupy: a candidate using
+`(10, 11)` conflicts with one using `(11, 12)`, not only with one starting at 10.
+
+Two candidates for the *same* session never conflict with each other, even when
+they share an instructor and a slot: at most one of them is ever selected.
+
+### Objective
+
+Each candidate carries a non-negative integer `penalty` and the engine minimises
+`sum(selected_penalty)`. The core is deliberately generic: it never interprets
+*why* a placement is expensive. Later adapters translate preferred or avoided
+times, period order and workload spreading into penalties. When every penalty is
+zero the problem is solved as pure feasibility, which is supported rather than
+special-cased.
+
+### Result
+
+| Status | Meaning | Placements |
+| --- | --- | --- |
+| `OPTIMAL` | Best weighted assignment proven | yes |
+| `FEASIBLE` | Valid assignment found, optimality unproven (usually a time limit) | yes |
+| `INFEASIBLE` | No conflict-free assignment exists | empty |
+| `MODEL_INVALID` | The solver rejected the constructed model (engine defect) | empty |
+| `UNKNOWN` | No proven answer, typically the time limit | empty |
+
+Statuses are never upgraded or downgraded: `UNKNOWN` is never reported as
+`INFEASIBLE`, and a feasible solution is never reported as optimal. The result
+also carries `objective_value`, `wall_time_seconds`, `num_conflicts`,
+`num_branches` and a `message`.
+
+`SolverResult.placements` are plain `ScheduledPlacement` values - no OR-Tools
+object is exposed - ordered by `day_of_week`, first slot id, component id, session
+id, candidate id, and `as_dict()` is JSON-serializable in principle even though no
+API exists yet.
+
+### Determinism and options
+
+Defaults favour reproducibility over speed: one search worker, a fixed
+`random_seed`, `max_time_seconds = 30` and `log_search_progress = False`. The same
+problem and options therefore return the same placements in the same order.
+Callers may raise the worker count for speed and accept that runs may then differ.
+
+### Input validation
+
+Invalid input fails as a `SolverInputError` before any CP-SAT model exists, never
+as an OR-Tools error: unknown session, duplicate session or candidate ids, empty
+or repeated slot ids, an empty candidate id, a negative penalty, a repeated
+instructor or group id, a session whose declared `candidate_ids` do not match its
+candidates, a reservation with no slots, and impossible options.
+
+Two documented behaviours:
+
+- a session with **no candidates** is valid but unsatisfiable, so the solve
+  returns `INFEASIBLE` and names that session in the message;
+- an **empty problem** solves to `OPTIMAL` with no placements and objective 0,
+  instead of crashing.
+
+Exact duplicate candidates for one session are rejected rather than silently
+deduplicated, because meaningless alternatives only enlarge the search.
+
+### Not in Phase 8
+
+- no `/api/scheduling/generate/` and no other scheduling endpoint - the OpenAPI
+  path set is unchanged from Phase 7;
+- no `Schedule`, `ScheduleVersion` or `ScheduleEntry` model, and no migration;
+- no persistence of solver results;
+- no Django problem builder: the engine does not know what a `CourseOffering`,
+  `TeachingComponent`, `InstructorProfile` or `Room` is;
+- no call to `PreSchedulingValidator` from inside the engine. Phase 9 orchestrates
+  `validate`, then `build candidates`, then `call engine`.
+
+Phase 9 will provide the Django problem builder and the department scheduler on
+top of this engine.
+
 ## Who may write what
 
 | Role | Reads | Writes |
@@ -876,8 +1023,12 @@ not used.
   periods, breaks and dated calendar exceptions.
 - **Phase 7 (done)** — pre-scheduling validation: a computed readiness report
   over the academic, resource and calendar data, with stable issue codes.
-- **Phase 8 (planned)** — timetable generation with OR-Tools: schedule entries
-  and actual room/time assignment, using the validator's checks as preconditions.
+- **Phase 8 (done)** — the generic CP-SAT scheduling engine: session demands,
+  placement candidates, hard resource conflicts, optional reservations and a
+  weighted candidate objective, with no API and no persistence.
+- **Phase 9 (planned)** — the Django problem builder and department scheduler:
+  build candidates from the academic, resource and calendar data, persist
+  `Schedule`/`ScheduleEntry` records and expose the scheduling API.
 - **Later** — reports/export, PostgreSQL, background jobs, Railway deployment.
 - **Flutter instructor app** — after the web application, using
   `/api/me/teaching-assignments/` as one of its first endpoints.
