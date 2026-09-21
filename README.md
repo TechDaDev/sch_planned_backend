@@ -56,8 +56,9 @@ sch_planner_backend/
 │   │   ├── validation/# issues, time_grid, resources, validator
 │   │   ├── solver/    # domain, validator, model_builder, solver, result
 │   │   ├── generation/# blocks, candidates, preferences, preview, service
-│   │   └── persistence/# snapshots, service (version history writer)
-│   ├── permissions.py # calendar visibility, validation scope, schedule read scope
+│   │   ├── persistence/# snapshots, service (version history writer)
+│   │   └── manual_edit/# domain, issues, validator, cloning, service
+│   ├── permissions.py # calendar visibility, validation scope, schedule read/edit scope
 │   ├── serializers.py # resource, validation, generation and persistence contracts
 │   ├── views.py       # time-grid viewsets, generation endpoints, schedule read APIs
 │   ├── urls.py        # /api/working-days/, /api/scheduling/generate/, /api/schedules/
@@ -186,6 +187,8 @@ All resource APIs expose the same five operations — `GET` list, `GET` detail,
 | Department draft          | `POST /api/schedules/generate-department-draft/` | own department (college admin: any) |
 | College draft             | `POST /api/schedules/generate-college-draft/` | college administrator or superuser only |
 | Schedule reads            | `GET /api/schedules/`, `/api/schedule-versions/` | college admin, or own-department drafts |
+| Manual edit validate      | `POST /api/schedule-versions/{id}/validate-manual-edit/` | college admin, or own-department draft |
+| Manual edit apply         | `POST /api/schedule-versions/{id}/manual-edit/` | college admin, or own-department draft |
 
 Write ownership in this table is stricter than read visibility for shared
 resources: shared instructors and rooms are readable by the departments they are
@@ -1485,6 +1488,139 @@ The generation pipeline stays read-only and knows nothing about persistence; the
 solver package knows nothing about either. The persistence service is the only writer
 of version history.
 
+## Validated manual editing
+
+```
+POST /api/schedule-versions/{id}/validate-manual-edit/
+POST /api/schedule-versions/{id}/manual-edit/
+```
+
+A stored version is immutable, so editing one is copy-on-write: the request names the
+placements to move, the server builds the complete proposed timetable in memory,
+validates it, and on success writes a **new** `DRAFT` version whose parent is the base
+version. The base version and its entries are never modified.
+
+```json
+{
+  "notes": "Moved two sessions off a room clash",
+  "changes": [
+    { "entry_id": 101, "time_slot_ids": [21, 22], "room_id": 7 },
+    { "entry_id": 105, "room_id": 9 }
+  ]
+}
+```
+
+Each change needs `entry_id` and at least one of `time_slot_ids` or `room_id`. An
+omitted `time_slot_ids` keeps the entry's periods; an omitted `room_id` keeps its room.
+So a move, a room swap, both at once, or several entries together are all one request.
+
+### Latest draft only
+
+The base version must belong to a schedule the caller can reach, be the **latest**
+version of that schedule, and still be `DRAFT`. Editing an older version would branch
+one linear chain (`V1 → V2 → V3`), so it is refused with `409 STALE_BASE_VERSION`; a
+version that is no longer a draft is refused with `409 BASE_VERSION_NOT_DRAFT`. The
+freshness check runs again inside the write transaction while the schedule row is
+locked, so two browsers cannot overwrite each other.
+
+### Validate first, write nothing
+
+The validation endpoint takes the same body, runs every check, and writes nothing. It
+exists so a user interface can test a drag-and-drop move before offering to save it.
+An invalid but well-formed proposal is a normal `200` with `valid: false` and the
+issues; a malformed body is `400`; an out-of-reach version is `404`; a stale or
+non-draft base is `409`.
+
+### The apply endpoint
+
+A valid request answers `200` with the new version's identity
+(`source: MANUAL_EDIT`, `parent_version`, `version_number`, `status: DRAFT`) and counts.
+It deliberately does **not** return `generated: true`, because no solver ran.
+
+An invalid proposal answers `409` with `reason: MANUAL_EDIT_VALIDATION_FAILED` and the
+issues inline, and creates zero versions and zero entries. Nothing is ever repaired
+automatically: if a move collides, the request fails and the user decides the fix.
+Several changes are evaluated as one final state, which is what makes an intentional
+swap of two sessions possible.
+
+### What is checked
+
+Placement checks, for the placements that move:
+
+- periods exist, are active, belong to an active working day of this semester;
+- one weekday per session, no gaps, and periods adjacent in canonical timetable order
+  (client order is ignored);
+- the stored session duration is preserved exactly — the base entry's own period
+  snapshots define the required minutes, so a 45 + 45 session cannot become 60 + 60;
+- the entry's existing instructors are still active, still allowed to teach for the
+  managing department, and available for the whole requested block;
+- the target room is active, shared with the managing department, satisfies the
+  component's current room requirement (type, capacity, capabilities) and is available.
+
+Collision checks, over the complete proposed version: no instructor, room, student
+group or teaching component may occupy one period twice. Overlaps are detected at
+the period granularity the solver itself uses, and each clashing pair is reported once
+with the shared period ids, so a two-period clash produces one issue rather than two
+identical ones. Issues come back in a documented deterministic order.
+
+`VIEWER` and `INSTRUCTOR` cannot edit at all, and a department administrator or
+scheduler can only reach their own department's drafts: a college-wide draft is not in
+their queryset, so it answers `404` rather than disclosing that it exists. College
+administrators may edit any draft. Joint participation in another department's course
+grants no edit authority.
+
+### Copy-on-write semantics
+
+A manual version is a complete timetable, never a delta. Every entry is cloned, and
+only a changed placement is rewritten:
+
+- **unchanged entries** keep their stored periods, room, snapshots, penalty and solver
+  `candidate_id` exactly as the base version had them;
+- **changed entries** keep their identity and history — `session_id`, ordinal,
+  component, managing department, course, offering and department snapshots, and their
+  instructor and student-group rows, names included — while the weekday, periods, room
+  and room snapshots are taken from the request;
+- a moved entry gets a documented manual identifier
+  (`manual:<base-entry-id>:day:<day>:slots:<ids>:room:<room-id>`) instead of the
+  solver's candidate id, because that id named a generated alternative that no longer
+  applies;
+- the penalty is recomputed with the Phase 9 preference policy for the requested
+  interval and the entry's own instructors.
+
+Renaming a live course, room, department, instructor or group therefore still cannot
+rewrite what an older version shows.
+
+### No solver, no re-optimisation
+
+Manual editing never invokes CP-SAT and never runs the generation pipelines. It
+validates the placement the user asked for and stores exactly that placement when it is
+valid; other entries are not moved to compensate. The new version stores `null` for
+`solver_status`, `objective_value`, `solver_wall_time_seconds`, `solver_num_conflicts`
+and `solver_num_branches`, and records a compact manual summary instead:
+
+```json
+{
+  "validation_summary": { "manual_edit": true, "base_version": 2, "changed_entries": 2, "validation_errors": 0 },
+  "generation_summary": { "manual_edit": true, "source_version_number": 2, "entries": 24, "changed_entries": 2 }
+}
+```
+
+Entry count and the set of `session_id` values are unchanged by construction: an edit
+relocates sessions, it never adds, removes or re-times one, so a component's weekly
+hours stay fulfilled. The whole version is written in one transaction, and the solve
+free path makes the re-check inside that transaction cheap.
+
+### Not in Phase 12
+
+- no workflow transitions: no submit, review, approve or publish endpoint, and every
+  version stays `DRAFT`;
+- no change requests, audit log, reports or export;
+- no instructor, student-group, component or course reassignment through an edit;
+- no automatic conflict repair and no global re-optimisation;
+- recurring weekly semantics only: a future holiday or exam date does not block a
+  weekly placement, matching the earlier phases;
+- no published-version reservations, and no Railway configuration.
+
 ## Who may write what
 
 | Role | Reads | Writes |
@@ -1575,7 +1711,9 @@ not used.
   `ScheduleVersion`, `ScheduleEntry` and the snapshot child tables, an explicit
   generate-and-persist endpoint per scope, and read-only history APIs. Drafts only,
   nothing published.
-- **Phase 12 (planned)** — workflow transitions and publication over the stored
+- **Phase 12 (done)** — validated manual editing of a draft: a validation endpoint and
+  a copy-on-write apply endpoint that append a `MANUAL_EDIT` version. No workflow yet.
+- **Phase 13 (planned)** — workflow transitions and publication over the stored
   versions.
 - **Later** — manual editing, reports/export, reservations and department
   regeneration from an authoritative version, PostgreSQL, background jobs, Railway

@@ -254,7 +254,7 @@ class SchedulePersistenceService:
             parent_version=latest,
             created_by=self.created_by,
             notes=self.notes,
-            solver_status=solver.status.value if solver is not None else "",
+            solver_status=solver.status.value if solver is not None else None,
             objective_value=solver.objective_value if solver is not None else None,
             solver_wall_time_seconds=(
                 solver.wall_time_seconds if solver is not None else None

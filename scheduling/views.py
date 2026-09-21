@@ -33,6 +33,7 @@ from scheduling.models import (
     WorkingDay,
 )
 from scheduling.permissions import (
+    CanEditScheduleDraft,
     CanManageCalendarExceptions,
     CanReadScheduleData,
     CanRunCollegeScheduleGeneration,
@@ -52,6 +53,10 @@ from scheduling.serializers import (
     CollegeScheduleGenerationInputSerializer,
     DepartmentGenerationResponseSerializer,
     GenerationRejectedSerializer,
+    ManualEditApplyResponseSerializer,
+    ManualEditRejectedSerializer,
+    ManualEditRequestSerializer,
+    ManualEditValidationResponseSerializer,
     PreSchedulingValidationInputSerializer,
     PreSchedulingValidationResponseSerializer,
     ScheduleDetailSerializer,
@@ -72,6 +77,12 @@ from scheduling.serializers import (
 from scheduling.services.generation import (
     CollegeScheduleGenerator,
     DepartmentScheduleGenerator,
+)
+from scheduling.services.manual_edit import (
+    BASE_STATE_CODES,
+    ManualEditChange,
+    ManualEditResult,
+    ManualEditService,
 )
 from scheduling.services.persistence import SchedulePersistenceService
 from scheduling.services.validation import PreSchedulingValidator, ValidationScope
@@ -405,6 +416,63 @@ ENTRY_FILTER_FIELDS = (
     "room",
     "day_of_week",
 )
+
+
+#: Manual-edit endpoints documented refusal body.
+_MANUAL_EDIT_RESPONSES = {
+    400: OpenApiResponse(
+        description=(
+            "Malformed body, an empty change list, a change that requests nothing, "
+            "or an unsupported field."
+        )
+    ),
+    401: OpenApiResponse(description="Authentication required."),
+    403: OpenApiResponse(
+        description="This role may not edit schedule drafts."
+    ),
+    404: OpenApiResponse(
+        description="Unknown version, or a version outside the caller's scope."
+    ),
+    409: ManualEditRejectedSerializer,
+}
+
+
+def _manual_edit_service(request, version, data) -> ManualEditService:
+    """Build the service for one request body.
+
+    The view only translates the validated payload into value objects; every rule
+    about whether the edit is allowed or valid lives in the service.
+    """
+    changes = [
+        ManualEditChange(
+            entry_id=change["entry_id"],
+            time_slot_ids=(
+                tuple(change["time_slot_ids"])
+                if change.get("time_slot_ids") is not None
+                else None
+            ),
+            room_id=change.get("room_id"),
+        )
+        for change in data["changes"]
+    ]
+    return ManualEditService(
+        version=version,
+        changes=changes,
+        created_by=request.user,
+        notes=data.get("notes", ""),
+    )
+
+
+def _base_state_issue(validation):
+    """The base-version issue of a validation run, or None.
+
+    These two codes describe the version rather than the request, so both manual-edit
+    endpoints answer them with a conflict even when the caller only wanted validation.
+    """
+    for issue in validation.issues:
+        if issue.code in BASE_STATE_CODES:
+            return issue
+    return None
 
 
 def _schedule_annotations(queryset):
@@ -768,3 +836,101 @@ class ScheduleVersionViewSet(QueryParameterFilterMixin, ReadOnlyModelViewSet):
                 ) from exc
             queryset = queryset.filter(**{field_name: value})
         return Response(ScheduleEntrySerializer(queryset, many=True).data)
+
+    @extend_schema(
+        summary="Validate a manual edit of a draft version",
+        description=(
+            "Checks whether the requested placement changes would produce a valid "
+            "weekly timetable, and stores nothing. Every change is applied to an "
+            "in-memory copy of the whole version first, so a swap of two sessions is "
+            "judged as one final state.\n\n"
+            "Placement checks cover the requested periods (existence, activity, "
+            "semester, one weekday, adjacency, unchanged duration), the entry's "
+            "existing instructors (active, still eligible for the managing "
+            "department, available) and the target room (active, shared, satisfying "
+            "the component's room requirement, available). Collision checks then "
+            "run over the complete proposed version for instructors, rooms, student "
+            "groups and teaching components.\n\n"
+            "An invalid but well-formed proposal answers ``200`` with "
+            "``valid: false``. A version that is not the newest ``DRAFT`` of its "
+            "schedule answers ``409``, because editing it would branch history."
+        ),
+        request=ManualEditRequestSerializer,
+        responses={
+            200: ManualEditValidationResponseSerializer,
+            **_MANUAL_EDIT_RESPONSES,
+        },
+    )
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="validate-manual-edit",
+        permission_classes=[IsAuthenticated, CanEditScheduleDraft],
+    )
+    def validate_manual_edit(self, request, pk=None):
+        version = self.get_object()
+        serializer = ManualEditRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        validation = _manual_edit_service(
+            request, version, serializer.validated_data
+        ).validate_only()
+
+        blocked = _base_state_issue(validation)
+        if blocked is not None:
+            return Response(
+                ManualEditRejectedSerializer(
+                    ManualEditResult(
+                        persisted=False,
+                        reason=blocked.code,
+                        message=blocked.message,
+                        validation=validation,
+                    )
+                ).data,
+                status=status.HTTP_409_CONFLICT,
+            )
+        return Response(ManualEditValidationResponseSerializer(validation).data)
+
+    @extend_schema(
+        summary="Apply a manual edit to a draft version",
+        description=(
+            "Validates the requested placement changes and, when they pass, stores "
+            "the result as the schedule's next ``DRAFT`` version with "
+            "``source: MANUAL_EDIT`` and the edited version as its parent.\n\n"
+            "The new version is a complete copy of the base version with only the "
+            "requested placements replaced: sessions, instructors, student groups and "
+            "every historical snapshot value are carried over, and a moved entry gets "
+            "a documented manual candidate id instead of the solver's. No solver runs "
+            "and nothing is re-optimised, so the version carries no solver metadata.\n\n"
+            "An invalid proposal answers ``409`` with "
+            "``MANUAL_EDIT_VALIDATION_FAILED`` and creates nothing. So does a base "
+            "version that is not the newest ``DRAFT``, reported as "
+            "``STALE_BASE_VERSION`` or ``BASE_VERSION_NOT_DRAFT``; the freshness check "
+            "runs again under a lock, so two simultaneous editors cannot overwrite "
+            "each other."
+        ),
+        request=ManualEditRequestSerializer,
+        responses={
+            200: ManualEditApplyResponseSerializer,
+            **_MANUAL_EDIT_RESPONSES,
+        },
+    )
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="manual-edit",
+        permission_classes=[IsAuthenticated, CanEditScheduleDraft],
+    )
+    def manual_edit(self, request, pk=None):
+        version = self.get_object()
+        serializer = ManualEditRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        result = _manual_edit_service(
+            request, version, serializer.validated_data
+        ).apply()
+
+        if not result.persisted:
+            return Response(
+                ManualEditRejectedSerializer(result).data,
+                status=status.HTTP_409_CONFLICT,
+            )
+        return Response(ManualEditApplyResponseSerializer(result).data)

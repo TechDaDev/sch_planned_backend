@@ -517,13 +517,15 @@ class ScheduleStatus(models.TextChoices):
 class ScheduleVersionSource(models.TextChoices):
     """How a version was produced.
 
-    Both values describe server-side generation. Manual copying or editing will be
-    added as its own value when it exists, so a version never has to guess its own
-    provenance.
+    The generation values describe server-side solving. ``MANUAL_EDIT`` describes a
+    copy of an existing version whose placements a user moved by hand, which is why
+    a manual version stores no solver metadata: claiming an engine produced it would
+    be a lie.
     """
 
     DEPARTMENT_GENERATION = "DEPARTMENT_GENERATION", "Department generation"
     COLLEGE_GENERATION = "COLLEGE_GENERATION", "College generation"
+    MANUAL_EDIT = "MANUAL_EDIT", "Manual edit"
 
 
 class Schedule(models.Model):
@@ -660,8 +662,9 @@ class ScheduleVersion(models.Model):
     )
     notes = models.TextField(blank=True, default="")
 
-    # Solver provenance of the generation that produced this version.
-    solver_status = models.CharField(max_length=32, blank=True, default="")
+    # Solver provenance of the generation that produced this version. A manually
+    # edited version stores null here instead of borrowing its parent's statistics.
+    solver_status = models.CharField(max_length=32, null=True, blank=True, default=None)
     objective_value = models.IntegerField(null=True, blank=True)
     solver_wall_time_seconds = models.FloatField(null=True, blank=True)
     solver_num_conflicts = models.IntegerField(null=True, blank=True)

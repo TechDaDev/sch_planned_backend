@@ -902,7 +902,9 @@ class ScheduleVersionSummarySerializer(serializers.Serializer):
     )
     created_by = ScheduleUserSummarySerializer(allow_null=True, required=False)
     notes = serializers.CharField(allow_blank=True, required=False)
-    solver_status = serializers.CharField(allow_blank=True, required=False)
+    solver_status = serializers.CharField(
+        allow_null=True, allow_blank=True, required=False
+    )
     objective_value = serializers.IntegerField(allow_null=True, required=False)
     entry_count = serializers.SerializerMethodField()
     created_at = serializers.DateTimeField()
@@ -1138,3 +1140,148 @@ class ScheduleDraftRejectedSerializer(serializers.Serializer):
     validation = PreSchedulingValidationResponseSerializer(allow_null=True, required=False)
     generation_issues = ValidationIssueSerializer(many=True, required=False)
     diagnostics = GenerationDiagnosticsSerializer(allow_null=True, required=False)
+
+
+# --- Phase 12: validated manual editing ------------------------------------
+
+
+class ManualEditChangeSerializer(StrictFieldValidationMixin, serializers.Serializer):
+    """One requested relocation of one existing entry.
+
+    Only the placement may move. Instructors, student groups, the teaching component,
+    the course and every snapshot value stay as the base version stored them, so
+    fields such as ``instructor_ids``, ``session_id``, ``penalty`` or ``status`` are
+    unsupported and are rejected rather than ignored.
+    """
+
+    entry_id = serializers.IntegerField(
+        min_value=1, help_text="Entry to relocate, from this schedule version."
+    )
+    time_slot_ids = serializers.ListField(
+        child=serializers.IntegerField(min_value=1),
+        required=False,
+        allow_empty=False,
+        help_text=(
+            "Teaching periods to occupy, in any order. Omit to keep the entry's "
+            "current periods."
+        ),
+    )
+    room_id = serializers.IntegerField(
+        min_value=1,
+        required=False,
+        allow_null=True,
+        help_text="Target room. Omit to keep the entry's current room.",
+    )
+
+    def validate(self, attrs):
+        """Require a placement change, and refuse a repeated period."""
+        if not attrs.get("time_slot_ids") and attrs.get("room_id") is None:
+            raise serializers.ValidationError(
+                "Supply time_slot_ids, room_id, or both."
+            )
+        slot_ids = attrs.get("time_slot_ids") or []
+        if len(set(slot_ids)) != len(slot_ids):
+            raise serializers.ValidationError(
+                {"time_slot_ids": "A period may not be listed twice."}
+            )
+        return attrs
+
+
+class ManualEditRequestSerializer(StrictFieldValidationMixin, serializers.Serializer):
+    """Request body of both manual-edit endpoints.
+
+    ``changes`` must not be empty: an edit that changes nothing is a mistake, not a
+    no-op version. The services treat the whole list as one simultaneous state, so a
+    swap is expressed as two changes in one request.
+    """
+
+    notes = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        default="",
+        max_length=SCHEDULE_NOTES_MAX_LENGTH,
+        help_text="Free-text note stored on the created version.",
+    )
+    changes = ManualEditChangeSerializer(
+        many=True, allow_empty=False, help_text="Placement changes to apply together."
+    )
+
+
+class ManualEditIssueSerializer(serializers.Serializer):
+    """One reason a proposed timetable was refused."""
+
+    code = serializers.CharField(
+        help_text="Stable issue code; the full list is documented in the README."
+    )
+    message = serializers.CharField()
+    entry_id = serializers.IntegerField(allow_null=True, required=False)
+    conflicting_entry_id = serializers.IntegerField(allow_null=True, required=False)
+    details = serializers.DictField(required=False)
+
+
+class ManualEditValidationResponseSerializer(serializers.Serializer):
+    """Result of validating a proposal without storing it.
+
+    ``valid`` is true only when no issue was reported. An invalid but well-formed
+    proposal is a normal ``200``; only a malformed request is a ``400``.
+    """
+
+    valid = serializers.SerializerMethodField()
+    base_version = serializers.IntegerField(source="base_version_id")
+    summary = serializers.SerializerMethodField()
+    issues = ManualEditIssueSerializer(many=True)
+
+    def get_valid(self, obj) -> bool:
+        return obj.valid
+
+    def get_summary(self, obj) -> dict:
+        return obj.as_summary()
+
+
+class ManualEditVersionSerializer(serializers.Serializer):
+    """Identity of the version a manual edit produced."""
+
+    id = serializers.IntegerField()
+    version_number = serializers.IntegerField()
+    status = serializers.ChoiceField(choices=ScheduleStatus.choices)
+    source = serializers.ChoiceField(choices=ScheduleVersionSource.choices)
+    parent_version = serializers.IntegerField(
+        source="parent_version_id", allow_null=True, required=False
+    )
+
+
+class ManualEditApplyResponseSerializer(serializers.Serializer):
+    """Response body of a stored manual edit.
+
+    ``generated`` is deliberately absent: no solver produced this version, and saying
+    otherwise would misdescribe it. Solver metadata on the version is null for the same
+    reason.
+    """
+
+    persisted = serializers.BooleanField()
+    schedule = serializers.IntegerField(source="schedule.id")
+    base_version = serializers.IntegerField(source="base_version_id")
+    version = ManualEditVersionSerializer()
+    summary = serializers.SerializerMethodField()
+
+    def get_summary(self, obj) -> dict:
+        return {"entries": obj.entry_count, "changed_entries": obj.changed_entries}
+
+
+class ManualEditRejectedSerializer(serializers.Serializer):
+    """Response body of a manual edit that stored nothing.
+
+    ``reason`` is one of ``MANUAL_EDIT_VALIDATION_FAILED``,
+    ``BASE_VERSION_NOT_DRAFT`` or ``STALE_BASE_VERSION``. In every case zero versions
+    and zero entries were created.
+    """
+
+    persisted = serializers.BooleanField()
+    reason = serializers.CharField()
+    message = serializers.CharField(allow_blank=True, required=False)
+    base_version = serializers.IntegerField(
+        source="base_version_id", allow_null=True, required=False
+    )
+    validation = ManualEditValidationResponseSerializer(
+        allow_null=True, required=False
+    )

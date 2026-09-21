@@ -31,6 +31,10 @@ own users see that department's drafts, college-wide drafts stay with college
 administrators until a later workflow publishes them, and ``INSTRUCTOR`` gets no
 administrative access at all. A department user without a department fails closed,
 and joint participation in another department's course grants no draft visibility.
+
+Phase 12 adds manual editing of a draft. It is a smaller role set than reading, and
+it deliberately reuses the read scoping for reachability: whatever a role cannot see
+it also cannot edit, so the two rules cannot disagree.
 """
 
 from django.db import models
@@ -202,6 +206,38 @@ class CanReadScheduleData(BasePermission):
         return can_read_schedule_data(request.user)
 
 
+#: Roles that may propose and store a manual edit of a draft version.
+#: ``VIEWER`` is deliberately absent: reading a draft is not editing it.
+SCHEDULE_EDIT_ROLES = frozenset(
+    {UserRole.COLLEGE_ADMIN, UserRole.DEPARTMENT_ADMIN, UserRole.SCHEDULER}
+)
+
+
+def can_edit_schedule_data(user) -> bool:
+    """True when the user's role may create a manual version at all."""
+    return bool(user.is_superuser or user.role in SCHEDULE_EDIT_ROLES)
+
+
+class CanEditScheduleDraft(BasePermission):
+    """Role gate for the manual-edit validate and apply endpoints.
+
+    The role decides whether manual editing is reachable; *which* schedule may be
+    edited is decided by the same queryset scoping the read APIs use. That keeps two
+    rules true without restating them: a department administrator cannot reach another
+    department's draft, and nobody below college administrator can reach a college-wide
+    draft, because such a version is not in their queryset at all (``404`` rather than
+    a disclosing ``403``).
+
+    ``VIEWER`` and ``INSTRUCTOR`` are refused outright, and participating in a joint
+    course grants no edit authority over the department that manages it.
+    """
+
+    def has_permission(self, request, view) -> bool:
+        if not is_authenticated_active_user(request):
+            return False
+        return can_edit_schedule_data(request.user)
+
+
 def resolve_validation_scope(user, *, scope, department):
     """Authorize a validation request and return the department to validate.
 
@@ -242,11 +278,14 @@ def resolve_validation_scope(user, *, scope, department):
 
 
 __all__ = [
+    "SCHEDULE_EDIT_ROLES",
     "SCHEDULE_READ_ROLES",
+    "CanEditScheduleDraft",
     "CanManageCalendarExceptions",
     "CanReadScheduleData",
     "CanRunCollegeScheduleGeneration",
     "CanRunPreSchedulingValidation",
+    "can_edit_schedule_data",
     "can_read_schedule_data",
     "resolve_validation_scope",
     "visible_calendar_exceptions_filter",

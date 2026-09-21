@@ -152,16 +152,21 @@ class ScheduleVersionAdmin(admin.ModelAdmin):
         "version_number",
         "status",
         "source",
+        "parent_version",
         "solver_status",
         "created_at",
     )
     list_filter = ("status", "source", "solver_status", "schedule__scope")
     search_fields = ("notes",)
-    list_select_related = ("schedule", "schedule__semester", "created_by")
+    list_select_related = ("schedule", "schedule__semester", "created_by", "parent_version")
     readonly_fields = ("created_at",)
 
     def has_change_permission(self, request, obj=None) -> bool:
-        """History is append-only, so the admin never edits a version."""
+        """History is append-only, so the admin never edits a version.
+
+        A manual edit is a copy-on-write API operation, not an admin form: editing a
+        stored snapshot here would bypass versioning entirely.
+        """
         return False
 
 
