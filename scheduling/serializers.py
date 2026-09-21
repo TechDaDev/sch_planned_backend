@@ -1624,3 +1624,104 @@ class ScheduleAnalyticsResponseSerializer(serializers.Serializer):
     room_utilization = AnalyticsRoomUsageSerializer(many=True)
     student_group_load = AnalyticsStudentGroupLoadSerializer(many=True)
     quality = AnalyticsQualitySerializer()
+
+
+# --- Phase 15: exports and imports ------------------------------------------
+#
+# The export endpoints answer a file, so they have no response serializer; their
+# documented schema is a binary body, declared on the views. The import endpoints answer
+# JSON, and these serializers are that contract: the same issue rows the service builds,
+# plus the counts of an apply.
+
+
+class ImportIssueSerializer(serializers.Serializer):
+    """One reported problem of a workbook.
+
+    ``row`` is the spreadsheet row a human must look at; it is ``0`` for an issue that
+    concerns the workbook or a whole sheet. ``column`` is null when the whole row is at
+    fault. ``code`` is stable and meant for tooling; ``message`` is for the reader.
+    """
+
+    sheet = serializers.CharField(allow_blank=True)
+    row = serializers.IntegerField(
+        help_text="Spreadsheet row number, or 0 for a workbook-level issue."
+    )
+    column = serializers.CharField(allow_null=True, required=False)
+    code = serializers.CharField()
+    severity = serializers.ChoiceField(choices=("ERROR", "WARNING"))
+    message = serializers.CharField()
+    details = serializers.DictField(required=False)
+
+
+class SemesterPlanValidationSummarySerializer(serializers.Serializer):
+    """Counts that describe the workbook as a whole."""
+
+    sheets = serializers.IntegerField(help_text="Data sheets that were read.")
+    rows = serializers.IntegerField(help_text="Data rows across every sheet.")
+    errors = serializers.IntegerField()
+    warnings = serializers.IntegerField()
+
+
+class SemesterPlanValidationResponseSerializer(serializers.Serializer):
+    """Response body of the validate endpoint.
+
+    ``valid`` is true only when nothing blocks an apply. A validate request never writes,
+    so the same workbook may be validated as often as needed.
+    """
+
+    valid = serializers.BooleanField()
+    summary = SemesterPlanValidationSummarySerializer()
+    issues = ImportIssueSerializer(many=True)
+
+
+class SemesterPlanImportScopeSerializer(serializers.Serializer):
+    """Echo of one authorized scope object of an apply response."""
+
+    id = serializers.IntegerField()
+    code = serializers.CharField(required=False)
+    name = serializers.CharField(required=False)
+    number = serializers.IntegerField(required=False)
+    academic_year = serializers.CharField(required=False)
+
+
+class SemesterPlanCreatedSerializer(serializers.Serializer):
+    """How many records of each type the apply created."""
+
+    courses = serializers.IntegerField()
+    student_groups = serializers.IntegerField()
+    offerings = serializers.IntegerField()
+    components = serializers.IntegerField()
+    component_group_links = serializers.IntegerField()
+    teaching_assignments = serializers.IntegerField()
+    room_requirements = serializers.IntegerField()
+    requirement_capabilities = serializers.IntegerField()
+
+
+class SemesterPlanApplyResponseSerializer(serializers.Serializer):
+    """Response body of the apply endpoint.
+
+    An apply that wrote nothing answers ``400`` and carries ``summary`` and the blocking
+    ``issues`` instead of counts, so a caller never has to guess why nothing changed.
+    """
+
+    applied = serializers.BooleanField()
+    department = SemesterPlanImportScopeSerializer(required=False)
+    semester = SemesterPlanImportScopeSerializer(required=False)
+    created = SemesterPlanCreatedSerializer()
+    warnings = ImportIssueSerializer(many=True)
+    summary = SemesterPlanValidationSummarySerializer(required=False)
+    issues = ImportIssueSerializer(many=True, required=False)
+
+
+class SemesterPlanImportRequestSerializer(serializers.Serializer):
+    """Multipart body of the validate and apply endpoints.
+
+    ``department`` and ``semester`` come from the request, never from the workbook, and
+    the file must be an .xlsx workbook.
+    """
+
+    department = serializers.IntegerField(
+        help_text="Department the plan is imported for."
+    )
+    semester = serializers.IntegerField(help_text="Semester the plan belongs to.")
+    file = serializers.FileField(help_text="The .xlsx workbook to read.")

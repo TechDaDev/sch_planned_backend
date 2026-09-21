@@ -13,8 +13,13 @@ from scheduling.views import (
     PreSchedulingValidationView,
     PublishedScheduleAnalyticsView,
     PublishedScheduleCurrentView,
+    PublishedScheduleExportPdfView,
+    PublishedScheduleExportXlsxView,
     ScheduleVersionViewSet,
     ScheduleViewSet,
+    SemesterPlanApplyView,
+    SemesterPlanTemplateView,
+    SemesterPlanValidateView,
     TimeSlotViewSet,
     WorkingDayViewSet,
 )
@@ -82,6 +87,34 @@ urlpatterns = [
         "published-schedules/current/analytics/",
         PublishedScheduleAnalyticsView.as_view(),
         name="published-schedule-analytics",
+    ),
+    # Phase 15: the same authoritative publication as a downloadable workbook or PDF.
+    path(
+        "published-schedules/current/export/xlsx/",
+        PublishedScheduleExportXlsxView.as_view(),
+        name="published-schedule-export-xlsx",
+    ),
+    path(
+        "published-schedules/current/export/pdf/",
+        PublishedScheduleExportPdfView.as_view(),
+        name="published-schedule-export-pdf",
+    ),
+    # Phase 15: the semester teaching plan template and import. These are the only
+    # multipart endpoints in the API; each opts in through its own parser_classes.
+    path(
+        "imports/semester-plan/template/",
+        SemesterPlanTemplateView.as_view(),
+        name="semester-plan-template",
+    ),
+    path(
+        "imports/semester-plan/validate/",
+        SemesterPlanValidateView.as_view(),
+        name="semester-plan-validate",
+    ),
+    path(
+        "imports/semester-plan/apply/",
+        SemesterPlanApplyView.as_view(),
+        name="semester-plan-apply",
     ),
     *router.urls,
 ]

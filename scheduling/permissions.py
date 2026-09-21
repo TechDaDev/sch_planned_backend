@@ -45,6 +45,12 @@ Phase 14 adds analytics over persisted versions. Management analytics reuse the 
 read scoping so they can never widen schedule access, and published analytics reuse the
 published timetable's role set: ``INSTRUCTOR`` keeps the timetable but gets no
 analytics dashboard.
+
+Phase 15 adds the semester teaching plan import. Importing writes academic structure, so
+it is a narrower role set than reading a draft: ``COLLEGE_ADMIN`` may import for any
+department and ``DEPARTMENT_ADMIN`` only for its own. ``SCHEDULER`` is refused because it
+has no catalog-write authority anywhere in the API, and ``VIEWER``/``INSTRUCTOR`` are
+refused as before. Exports stay read-only and reuse the Phase 14 access rules.
 """
 
 from django.db import models
@@ -273,6 +279,57 @@ class CanReadPublishedAnalytics(BasePermission):
         return can_read_published_analytics(request.user)
 
 
+#: Roles that may import a semester teaching plan.
+#: ``SCHEDULER`` is deliberately absent: it holds no catalog-write authority anywhere in
+#: the API, and importing creates courses, groups, offerings and components.
+SEMESTER_PLAN_IMPORT_ROLES = frozenset(
+    {UserRole.COLLEGE_ADMIN, UserRole.DEPARTMENT_ADMIN}
+)
+
+
+def can_import_semester_plan(user) -> bool:
+    """True when the user's role may import a teaching plan at all."""
+    return bool(user.is_superuser or user.role in SEMESTER_PLAN_IMPORT_ROLES)
+
+
+class CanImportSemesterPlan(BasePermission):
+    """Role gate for the semester teaching plan template, validate and apply endpoints.
+
+    The role decides whether importing is reachable; *which* department may be imported
+    into is decided by :func:`resolve_import_department`, which reads the request's own
+    department field rather than anything inside the workbook.
+    """
+
+    def has_permission(self, request, view) -> bool:
+        if not is_authenticated_active_user(request):
+            return False
+        return can_import_semester_plan(request.user)
+
+
+def resolve_import_department(user, *, department):
+    """Authorize an import request and return the department it may write to.
+
+    The department comes from the request body, never from the workbook, so a spreadsheet
+    cannot choose its own target. A department-scoped caller reaches only its own
+    department; a department-scoped caller without a department fails closed with
+    ``403``; a college administrator may name any department.
+    """
+    if department is None:
+        raise ValidationError({"department": "This field is required."})
+    if user.has_cross_department_access:
+        return department
+    if user.department_id is None:
+        raise PermissionDenied(
+            "Your account is not attached to a department, so there is no department "
+            "to import for."
+        )
+    if department.pk != user.department_id:
+        raise ValidationError(
+            {"department": "You may only import for your own department."}
+        )
+    return department
+
+
 class CanRunScheduleWorkflow(BasePermission):
     """Role gate for the workflow actions and the workflow validation report.
 
@@ -356,7 +413,9 @@ __all__ = [
     "SCHEDULE_EDIT_ROLES",
     "SCHEDULE_READ_ROLES",
     "SCHEDULE_WORKFLOW_ROLES",
+    "SEMESTER_PLAN_IMPORT_ROLES",
     "CanEditScheduleDraft",
+    "CanImportSemesterPlan",
     "CanManageCalendarExceptions",
     "CanReadPublishedAnalytics",
     "CanReadScheduleData",
@@ -364,9 +423,11 @@ __all__ = [
     "CanRunPreSchedulingValidation",
     "CanRunScheduleWorkflow",
     "can_edit_schedule_data",
+    "can_import_semester_plan",
     "can_read_published_analytics",
     "can_read_schedule_data",
     "can_run_schedule_workflow",
+    "resolve_import_department",
     "resolve_validation_scope",
     "visible_calendar_exceptions_filter",
     "visible_schedules_filter",

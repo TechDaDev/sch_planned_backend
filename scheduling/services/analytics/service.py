@@ -92,9 +92,15 @@ class ScheduleAnalyticsService:
             scope="DEPARTMENT" if department is not None else schedule.scope,
         )
 
-    def build(self) -> VersionAnalytics:
-        """Compute the report."""
-        facts = self._load_facts()
+    def build(self, *, facts: tuple[EntryFacts, ...] | None = None) -> VersionAnalytics:
+        """Compute the report.
+
+        Callers that already hold the loaded entry facts (Phase 15 exports) pass them
+        in, so one request loads the entries once and both the report and the exported
+        timetable describe exactly the same scoped entry set.
+        """
+        if facts is None:
+            facts = self.facts()
         instructor_gap_totals = instructor_gaps(facts)
         group_gap_totals = group_gaps(facts)
         availability = weeks_availability_by_room(
@@ -134,6 +140,15 @@ class ScheduleAnalyticsService:
         )
 
     # --- loading -----------------------------------------------------------
+
+    def facts(self) -> tuple[EntryFacts, ...]:
+        """The scoped entry facts this report is built from.
+
+        Exposed so a caller that needs the entries themselves - the Phase 15 exports -
+        reuses this loader instead of restating the scope filter. Read-only, like
+        everything else here.
+        """
+        return self._load_facts()
 
     def _load_facts(self) -> tuple[EntryFacts, ...]:
         """Reshape the version's entries, and only the allowed ones, into facts.
@@ -217,6 +232,11 @@ class ScheduleAnalyticsService:
             component_id=entry.teaching_component_id,
             component_type=entry.component_type_snapshot,
             component_label=entry.component_label_snapshot,
+            offering_code=entry.offering_code_snapshot,
+            periods=tuple(
+                row.label_snapshot.strip() or str(row.sequence_snapshot)
+                for row in slots
+            ),
             department=SnapshotRef(
                 id=entry.managing_department_id,
                 code=entry.managing_department_code_snapshot,

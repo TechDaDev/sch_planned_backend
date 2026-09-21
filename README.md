@@ -4,9 +4,9 @@ Django REST Framework backend for the College Academic Schedule Planner.
 Provides the project foundation (configuration package, domain app skeletons,
 custom user model, API/OpenAPI plumbing) that later phases build on.
 
-- Current phase: **Phase 14 — schedule reports and analytics** (read-only reports over a
-  stored `ScheduleVersion` and over the officially published timetable). No model is
-  added and nothing is exported yet: report files are Phase 15.
+- Current phase: **Phase 15 — Excel/PDF export and controlled Excel import** (read-only
+  timetable and report downloads over persisted versions and the published timetable,
+  plus a validate-then-apply semester teaching plan import).
 
 ## Architecture
 
@@ -59,7 +59,9 @@ sch_planner_backend/
 │   │   ├── persistence/# snapshots, service (version history writer)
 │   │   ├── manual_edit/# domain, issues, validator, cloning, service
 │   │   ├── workflow/  # issues, validation, service, publication
-│   │   └── analytics/ # domain, summary, workload, rooms, gaps, quality, service
+│   │   ├── analytics/ # domain, summary, workload, rooms, gaps, quality, service
+│   │   ├── exports/   # domain, tables, excel, pdf, filenames, service
+│   │   └── imports/   # domain, issues, workbook, template, validator, applier, service
 │   ├── permissions.py # calendar visibility, validation scope, schedule read/edit scope
 │   ├── serializers.py # resource, validation, generation and persistence contracts
 │   ├── views.py       # time-grid viewsets, generation endpoints, schedule read APIs
@@ -67,7 +69,8 @@ sch_planner_backend/
 │   └── migrations/    # 0001_calendar_and_time_configuration,
 │                      # 0002_schedule_persistence,
 │                      # 0003_manual_edit_support, 0004_workflow_publication
-├── reports/           # report exports (Phase 15; empty today)
+├── reports/           # reserved for later report artifacts (Phase 15 exports are
+│                      # generated on request in scheduling/services/exports/)
 ├── tests/             # pytest suite for the whole project
 ├── manage.py
 ├── requirements.txt
@@ -197,6 +200,13 @@ All resource APIs expose the same five operations — `GET` list, `GET` detail,
 | Published timetable       | `GET /api/published-schedules/current/?semester=` | any authenticated user, filtered by role |
 | Version analytics         | `GET /api/schedule-versions/{id}/analytics/` | schedule read roles, in scope (see the analytics section) |
 | Published analytics       | `GET /api/published-schedules/current/analytics/?semester=` | management roles, filtered by role |
+| Version export (Excel)    | `GET /api/schedule-versions/{id}/export/xlsx/` | schedule read roles, in scope |
+| Version export (PDF)      | `GET /api/schedule-versions/{id}/export/pdf/` | schedule read roles, in scope |
+| Published export (Excel)  | `GET /api/published-schedules/current/export/xlsx/?semester=` | management roles, filtered by role |
+| Published export (PDF)    | `GET /api/published-schedules/current/export/pdf/?semester=` | management roles, filtered by role |
+| Import template           | `GET /api/imports/semester-plan/template/` | college or department administrator |
+| Import validate           | `POST /api/imports/semester-plan/validate/` (multipart) | college or department administrator |
+| Import apply              | `POST /api/imports/semester-plan/apply/` (multipart) | college or department administrator |
 
 Write ownership in this table is stricter than read visibility for shared
 resources: shared instructors and rooms are readable by the departments they are
@@ -1960,17 +1970,310 @@ and only the pointer says which timetable is official.
 Report generation is a service first and an endpoint second.
 `ScheduleAnalyticsService.for_version(version)` and
 `ScheduleAnalyticsService.for_published(schedule, department=...)` return value objects
-that render straight to JSON, and the exported documents of Phase 15 will reuse them
-instead of re-deriving numbers from the ORM.
+that render straight to JSON, and the Phase 15 exports consume both the report and its
+scoped entry facts instead of re-deriving numbers from the ORM.
 
 ### Not in Phase 14
 
-- no PDF, Excel or CSV export, and no download endpoint;
+- no PDF, Excel or CSV export, and no download endpoint (both arrive in Phase 15);
 - no composite quality score, ranking or recommendation;
 - no instructor analytics dashboard;
 - no stored report: analytics are computed per request and never persisted;
 - no new model, no new field and no migration;
 - no writes of any kind, no caching layer and no background job.
+
+## Schedule export (Excel and PDF)
+
+```
+GET /api/schedule-versions/{id}/export/xlsx/
+GET /api/schedule-versions/{id}/export/pdf/
+
+GET /api/published-schedules/current/export/xlsx/?semester=<id>
+GET /api/published-schedules/current/export/pdf/?semester=<id>
+```
+
+A download is a *representation* of a report, not a new analysis. Both export routes use
+the Phase 14 service directly, in-process:
+
+* the version routes call `ScheduleAnalyticsService.for_version(...)`, exactly as
+  `GET /api/schedule-versions/{id}/analytics/` does;
+* the published routes call `ScheduleAnalyticsService.for_published(...)`, which reads the
+  schedule's authoritative `published_version` pointer and narrows a department's entry
+  set *before* aggregation.
+
+The export layer never recomputes a count, workload, gap or quality figure, so a workbook
+cannot disagree with the analytics endpoint it came from. The timetable rows come from the
+same scoped entry facts, so the file and the report always describe one entry set.
+
+Access is the access the source already had, and the source is chosen before the document
+is built:
+
+| Route | Who | Result |
+| --- | --- | --- |
+| Version export | the roles that may read schedule drafts (`COLLEGE_ADMIN`, `DEPARTMENT_ADMIN`, `SCHEDULER`, `VIEWER`), scoped to versions they may read | out of scope answers `404`, and no draft visibility widens because a file exists |
+| Published export | the published analytics roles (the same four; `INSTRUCTOR` is refused with `403`) | college administrator: the whole college; department user: the entries their department manages plus the joint sessions it attends; a department-scoped account without a department fails closed |
+| Either published route | a semester with no publication | `404`, never a draft fallback |
+
+Files are built in memory and returned as an attachment with a sanitized filename
+(`schedule_semester-3_version-4.xlsx`, `published_schedule_semester-3_department-BIO.pdf`).
+Every export is read-only: repeated calls create no schedule, version, entry, workflow or
+academic change.
+
+### The Excel workbook
+
+Seven sheets, in this order, every time:
+
+| Sheet | Content |
+| --- | --- |
+| `Timetable` | one row per persisted placement: managing department, course code and name, offering, component type and label, session, weekday, start, end, occupied periods, room code and name, instructors, student groups, penalty |
+| `Analytics Summary` | document metadata (scope, semester, schedule, version, status, source, created, published, department, generated) followed by the headline counts and, for a department report, the managed/participating split |
+| `Department Load` | per managing department: components, sessions, minutes, hours, courses, instructors, rooms, groups, joint sessions |
+| `Instructor Workload` | per instructor: sessions, primary/assistant split, minutes, hours, active days, busiest day, departments, gap figures |
+| `Room Utilization` | per room: sessions, occupied minutes/periods/days, `utilization_basis`, available minutes, utilization percent, configuration mismatch |
+| `Student Group Load` | per group: sessions, minutes, hours, active days, managing departments, gap figures |
+| `Quality` | preference penalty, gap totals and averages, sessions per weekday and start time, busiest day per instructor and per group |
+
+Periods are joined into one cell rather than expanded into extra rows, so one placement is
+one row. Every sheet of a department-scoped workbook reflects only that department's scoped
+entry set: nothing is generated for the whole college and then hidden.
+
+Presentation is deliberately simple - bold headers, a frozen header row, an auto-filter,
+readable column widths, wrapped long text and two-decimal hour formats - with no formulas
+and no macros, so the file opens the same way in Microsoft Excel, LibreOffice and Google
+Sheets.
+
+### Snapshot semantics
+
+Descriptive values come from the version's snapshot columns: course code and name, offering
+code, component type and label, managing department code and name, room code and name,
+instructor names, group codes, names and departments, and period labels and times. Renaming
+a live course, room, department, instructor or group after publication does not change a
+historical export.
+
+Room utilization is the one figure whose denominator cannot come from the snapshot, so it
+is labelled instead of silently mixed: `utilization_basis` is
+`CURRENT_ROOM_AVAILABILITY` on every room row, `available_minutes` and
+`utilization_percent` are null when today's configuration cannot supply a denominator, and
+a schedule that occupies more time than today's grid allows is reported above 100 with
+`configuration_mismatch`.
+
+### Formula injection protection
+
+Everything a workbook receives is data. `sanitize_cell` neutralizes any string that begins
+with `=`, `+`, `-`, `@`, a tab or a carriage return by prefixing it with an apostrophe, so a
+spreadsheet cannot execute a course name, room name, department name, instructor name, group
+name, note, code or label. Numbers stay numbers, and no export ever writes a formula of its
+own.
+
+### The PDF report
+
+The PDF carries a title, the same document metadata, the same scoped timetable as a
+paginated landscape table, and a concise analytics section: sessions, scheduled hours,
+departments, instructors, rooms, student groups, preference penalty, gap totals and the
+per-weekday distribution. No composite quality score is invented.
+
+The timetable is a single flowable table, so ReportLab splits it across pages and the header
+row repeats: a session is never dropped because it crosses a page boundary.
+
+### Unicode and Arabic
+
+ReportLab draws glyphs, it does not shape Arabic, so text that contains right-to-left
+characters is reshaped with `arabic-reshaper` and reordered with `python-bidi` before it is
+drawn (both are declared dependencies, never transitive). Before anything is drawn, the
+resolved font is checked against every character the document will contain.
+
+The font is resolved from `PDF_EXPORT_FONT_REGULAR` / `PDF_EXPORT_FONT_BOLD` when set, then
+from the common open-source locations (DejaVu Sans, Liberation Sans, FreeSerif, Noto). When
+no usable font exists - or the font cannot draw a character the document contains - the
+endpoint answers `503` with the reason instead of producing a document with empty boxes.
+
+> **Deployment note.** A PDF export needs a Unicode-capable TrueType font that covers
+> Latin plus Arabic, including the Arabic presentation forms produced by reshaping.
+> `DejaVuSans.ttf` and `DejaVuSans-Bold.ttf` satisfy this and are used by default in
+> development. A host without them must set `DJANGO_PDF_EXPORT_FONT_REGULAR` and
+> `DJANGO_PDF_EXPORT_FONT_BOLD` to an open-source font it ships. No proprietary font is
+> bundled, and Railway configuration is not part of Phase 15.
+
+## Semester teaching plan import
+
+```
+GET  /api/imports/semester-plan/template/
+POST /api/imports/semester-plan/validate/      (multipart: department, semester, file)
+POST /api/imports/semester-plan/apply/         (multipart: department, semester, file)
+```
+
+The import prepares **one department for one semester**: the academic teaching plan, not a
+timetable. It creates courses, student groups, course offerings, teaching components,
+component/group links, teaching assignments and room requirements, and it never touches the
+scheduling side of the system.
+
+### The one multipart exception
+
+The API is JSON-only everywhere else, and it stays that way: `DEFAULT_PARSER_CLASSES` is
+unchanged and only these three endpoints declare `MultiPartParser`. Every other endpoint
+still rejects a form body with `415`.
+
+The file is optional for the template route and required, with `department` and `semester`,
+for the other two. The scope comes from the request body - never from the workbook - so a
+spreadsheet cannot choose to import into another department or another semester.
+
+### Workbook schema
+
+Nine sheets, fixed: `README`, `Courses`, `StudentGroups`, `CourseOfferings`,
+`TeachingComponents`, `ComponentGroups`, `TeachingAssignments`, `RoomRequirements`,
+`RequirementCapabilities`. The `README` sheet documents the template and is ignored while
+parsing data; the other eight must be present, and any other sheet is refused, so a
+mistyped tab cannot hide rows.
+
+| Sheet | Required columns | Optional columns |
+| --- | --- | --- |
+| `Courses` | `course_ref`, `code`, `name` | `description` |
+| `StudentGroups` | `group_ref`, `program_code`, `stage_number`, `code`, `name` | `student_count`, `parent_group_ref` |
+| `CourseOfferings` | `offering_ref`, `course_ref` | `offering_code` (default `MAIN`) |
+| `TeachingComponents` | `component_ref`, `offering_ref`, `component_type`, `weekly_hours`, `session_duration_hours` | `label` |
+| `ComponentGroups` | `component_ref`, `group_ref` | - |
+| `TeachingAssignments` | `component_ref`, `staff_code` | `assignment_role` (default `PRIMARY`) |
+| `RoomRequirements` | `component_ref` | `required_room_type_code`, `minimum_capacity` |
+| `RequirementCapabilities` | `component_ref`, `capability_code` | - |
+
+A `*_ref` column is a label that exists only inside the workbook (`C01`, `G01`, `O01`,
+`TC01`): database ids never appear in a template, and the workbook's own rows are connected
+by those refs. Columns such as `program_code`, `stage_number`, `staff_code`,
+`required_room_type_code` and `capability_code` reference **existing** records by their
+stable code, because those records have owners and sharing rules of their own.
+
+Surrounding whitespace is trimmed from every cell; that is the whole of the normalization.
+Enum values are matched case-insensitively and stored canonically (`THEORY`, `PRACTICAL`,
+`PRIMARY`, `ASSISTANT`).
+
+### What the import may change
+
+It creates only:
+
+```
+Course, StudentGroup, CourseOffering, TeachingComponent,
+TeachingComponentGroup, TeachingAssignment,
+TeachingComponentRoomRequirement, TeachingComponentCapabilityRequirement
+```
+
+It references, and never creates or edits: `StudyProgram`, `StudyStage`,
+`InstructorProfile`, `RoomType`, `RoomCapability`, `Semester`, `Department`.
+
+It never touches: schedules, versions, entries, workflow status, the publication pointer,
+sharing grants, instructor or room availability, the calendar and time grid, rooms
+themselves, instructor profiles themselves, or any account, password or role. Instructors
+are referenced by `staff_code` and rooms only by `room_type_code`/`capability_code`, which is
+what keeps the Phase 4 and Phase 5 ownership rules intact: a department spreadsheet cannot
+create a foreign instructor, grant itself sharing, or pick a specific room.
+
+### Validate, then apply
+
+`validate/` performs the complete reading and validation and creates **zero** rows, so it can
+be called as often as needed. It answers `200` with `valid`, a summary and the issue list:
+
+```json
+{
+  "valid": false,
+  "summary": { "sheets": 8, "rows": 54, "errors": 3, "warnings": 1 },
+  "issues": [
+    {
+      "sheet": "TeachingAssignments",
+      "row": 7,
+      "column": "staff_code",
+      "code": "INSTRUCTOR_NOT_FOUND",
+      "severity": "ERROR",
+      "message": "No instructor profile with staff code 'I-900' exists. ...",
+      "details": {}
+    }
+  ]
+}
+```
+
+`apply/` re-reads and fully re-validates the same upload against **current** database state
+immediately before writing: there is no validated-token flow, and a response from an earlier
+request is never trusted. With one blocking issue nothing is written and the answer is `400`
+with the blocking issues. Otherwise every record is created inside a single
+`transaction.atomic()`, so a failure half way through rolls the whole import back, and the
+answer is `200` with counts:
+
+```json
+{
+  "applied": true,
+  "department": { "id": 2, "code": "BIO", "name": "Biology" },
+  "semester": { "id": 3, "number": 1, "academic_year": "2026-2027" },
+  "created": {
+    "courses": 5, "student_groups": 2, "offerings": 5, "components": 8,
+    "component_group_links": 8, "teaching_assignments": 8,
+    "room_requirements": 8, "requirement_capabilities": 6
+  },
+  "warnings": []
+}
+```
+
+### Create-only, never overwrite
+
+Phase 15 import policy is `CREATE_ONLY`. An object that already exists is a refusal, not an
+update: `COURSE_ALREADY_EXISTS`, `GROUP_ALREADY_EXISTS` and `OFFERING_ALREADY_EXISTS` name
+the conflict and nothing is written. Rows that are meant to be *references* - programs,
+stages, instructors, room types, capabilities, the semester and the department - are looked
+up and never created. That makes a spreadsheet safe to re-run: the second attempt fails
+visibly instead of silently rewriting academic data.
+
+### Validation rules
+
+Every row is turned into an unsaved model instance and validated with the same `clean()`
+rules the HTTP API uses, so a component whose weekly hours do not divide into whole sessions
+is refused here for the same reason it is refused on `POST /api/teaching-components/`.
+Instructor eligibility reuses `InstructorProfile.can_teach_in_department`, which is why a
+workbook cannot assign an instructor the department could not assign through the API.
+
+Cross-sheet validation covers unresolved references (`COURSE_REF_NOT_FOUND`,
+`OFFERING_REF_NOT_FOUND`, `COMPONENT_REF_NOT_FOUND`, `GROUP_REF_NOT_FOUND`), duplicate
+workbook refs (`DUPLICATE_REF`), duplicate relation rows (`DUPLICATE_RELATION`), parent
+hierarchy problems (`PARENT_GROUP_SELF`, `PARENT_GROUP_NOT_IN_WORKBOOK`,
+`PARENT_GROUP_DIFFERENT_STAGE`, `PARENT_GROUP_CYCLE`), the Phase 3 overlap rule
+(`GROUP_HIERARCHY_OVERLAP`), one active primary per component
+(`MULTIPLE_PRIMARY_INSTRUCTORS`), capability rows without a room requirement
+(`ROOM_REQUIREMENT_MISSING`) and room types or capabilities that do not exist or are
+inactive.
+
+Two informational warnings do not block an apply, because a plan may legitimately be
+completed later: `NO_PRIMARY_INSTRUCTOR` and `COMPONENT_WITHOUT_GROUP`. Neither replaces the
+Phase 7 readiness report, and the import does not require a workbook to be schedule-ready.
+
+Cross-department rows are the one capability that needs college-level authority: creating a
+group under another department's program, or linking another department's students into a
+course, is refused for a department administrator
+(`PROGRAM_OUTSIDE_DEPARTMENT`, `CROSS_DEPARTMENT_LINK_REQUIRES_COLLEGE_ADMIN`) and allowed
+for a college administrator, mirroring the Phase 3 rule that joint teaching across
+departments is a college-level act.
+
+Issues are ordered by sheet (in the documented sheet order), then row, then column, then
+code, and exact duplicates are merged, so validating an unchanged workbook twice returns the
+same list in the same order.
+
+### Safety limits and file guards
+
+| Guard | Value | Behavior |
+| --- | --- | --- |
+| File type | `.xlsx` only | `.xls`, `.xlsm`, `.csv`, archives and non-spreadsheet content are refused (`UNSUPPORTED_FILE_TYPE`, `NOT_A_WORKBOOK`) |
+| Macros | none | a workbook containing `xl/vbaProject.bin` is refused (`MACRO_ENABLED_WORKBOOK`) |
+| Upload size | 5 MB | refused before the file is buffered (`FILE_TOO_LARGE`) |
+| Rows per sheet | 2000 data rows | `SHEET_ROW_LIMIT_EXCEEDED` |
+| Rows per workbook | 10000 data rows | `TOTAL_ROW_LIMIT_EXCEEDED` |
+| Scanned rows per sheet | 20000 spreadsheet rows | `SCANNED_ROW_LIMIT_EXCEEDED`, so a sheet formatted far past its data is refused rather than walked |
+| Cells | data only | a formula is an error (`FORMULA_NOT_ALLOWED`); nothing is ever evaluated |
+| Empty rows | ignored | blank rows, including formatted-but-empty trailing rows, are skipped |
+
+All five limits are settings (see the configuration table), so a deployment can tighten them.
+Nothing is read before the scope is authorized: role, department and semester are checked
+before a single cell is examined. Malformed workbooks answer with issues, never with a `500`.
+
+The download template is generated from the same schema constants the reader enforces, so it
+cannot drift, and it is byte-identical between downloads (fixed document and archive
+timestamps). The data sheets carry headers only, with the examples in the `README` sheet, so
+validating the untouched template reports `8` sheets, `0` rows, `0` errors and applying it
+writes nothing.
 
 ## Who may write what
 
@@ -2006,6 +2309,13 @@ and, for teaching and instructor resources, `IsDepartmentScopedManager` with the
 `visible_*_filter` helpers). Instructor read visibility lives in
 `resources/permissions.py`.
 
+Phase 15 adds two narrower rules on top: the semester teaching plan import is limited to
+`COLLEGE_ADMIN` and `DEPARTMENT_ADMIN` (`CanImportSemesterPlan`), because it writes academic
+structure - `SCHEDULER` is refused here even though it may submit and edit drafts, and
+`VIEWER`/`INSTRUCTOR` are refused as everywhere else. Exports add no authority of their own:
+they reuse the read scoping of the version (Phase 11-14) or of the published timetable, so a
+file can never show more than the API already would.
+
 ## Timezone
 
 Django runs timezone-aware (`USE_TZ = True`) with `TIME_ZONE = "Asia/Baghdad"`.
@@ -2022,6 +2332,12 @@ Settings are read from environment variables (optionally via `.env`):
 | `DJANGO_DEBUG`                | `True`                                           |
 | `DJANGO_ALLOWED_HOSTS`        | `localhost,127.0.0.1`                            |
 | `DJANGO_CORS_ALLOWED_ORIGINS` | `http://localhost:3000,http://127.0.0.1:3000`    |
+| `DJANGO_PDF_EXPORT_FONT_REGULAR` | empty: search the default open-source font locations |
+| `DJANGO_PDF_EXPORT_FONT_BOLD` | empty: search the default open-source font locations |
+| `DJANGO_SEMESTER_PLAN_IMPORT_MAX_BYTES` | `5242880` (5 MB)                        |
+| `DJANGO_SEMESTER_PLAN_IMPORT_MAX_SHEET_ROWS` | `2000`                            |
+| `DJANGO_SEMESTER_PLAN_IMPORT_MAX_TOTAL_ROWS` | `10000`                           |
+| `DJANGO_SEMESTER_PLAN_IMPORT_MAX_SCANNED_ROWS` | `20000`                         |
 
 Other fixed settings: `AUTH_USER_MODEL = "accounts.User"`,
 `TIME_ZONE = "Asia/Baghdad"`, `USE_I18N = True`, `USE_TZ = True`, SQLite via
@@ -2067,10 +2383,13 @@ not used.
 - **Phase 13 (done)** — workflow and official publication: submit, review, approve and
   publish with full revalidation, and the authoritative published timetable readable
   by departments and instructors.
-- **Phase 14 (done)** — schedule reports and analytics: read-only management and
-  published analytics over persisted versions, with snapshot-stable counts, workloads,
-  gaps and quality figures, and utilization labelled as current-configuration.
-- **Phase 15 (planned)** — report export over the published versions.
+- **Phase 14 (done)** — schedule reports and analytics: read-only management and published
+  analytics over persisted versions, with snapshot-stable counts, workloads, gaps and
+  quality figures, and utilization labelled as current-configuration.
+- **Phase 15 (done)** — Excel/PDF export and controlled Excel import: read-only timetable
+  and report downloads over persisted versions and the published timetable, a generated
+  import template, and a validate-then-apply semester teaching plan import.
+- **Phase 16 (planned)** — the next phase; its scope is not fixed in this repository yet.
 - **Later** — reservations and department regeneration from an authoritative version,
   PostgreSQL, background jobs, Railway deployment.
 - **Flutter instructor app** — after the web application, using

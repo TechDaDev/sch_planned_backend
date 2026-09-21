@@ -107,6 +107,8 @@ class EntryFacts:
     component_id: int
     component_type: str
     component_label: str
+    offering_code: str
+    periods: tuple[str, ...]
     department: SnapshotRef
     room: SnapshotRef | None
     instructors: tuple[InstructorFact, ...]

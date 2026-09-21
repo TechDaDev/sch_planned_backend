@@ -176,6 +176,30 @@ REST_FRAMEWORK = {
 }
 
 
+# Phase 15 exports and imports.
+
+# PDF rendering needs a Unicode-capable TrueType font (Latin plus Arabic). These paths
+# are optional: when unset, the exporter searches the common open-source locations and
+# refuses the request rather than emitting a PDF whose text it cannot draw.
+PDF_EXPORT_FONT_REGULAR = os.environ.get("DJANGO_PDF_EXPORT_FONT_REGULAR", "")
+PDF_EXPORT_FONT_BOLD = os.environ.get("DJANGO_PDF_EXPORT_FONT_BOLD", "")
+
+# Bounds of the semester teaching plan upload. They protect the reader from an oversized
+# file or a workbook formatted far past its data; a deployment can tighten them.
+SEMESTER_PLAN_IMPORT_MAX_BYTES = int(
+    os.environ.get("DJANGO_SEMESTER_PLAN_IMPORT_MAX_BYTES", 5 * 1024 * 1024)
+)
+SEMESTER_PLAN_IMPORT_MAX_SHEET_ROWS = int(
+    os.environ.get("DJANGO_SEMESTER_PLAN_IMPORT_MAX_SHEET_ROWS", 2000)
+)
+SEMESTER_PLAN_IMPORT_MAX_TOTAL_ROWS = int(
+    os.environ.get("DJANGO_SEMESTER_PLAN_IMPORT_MAX_TOTAL_ROWS", 10000)
+)
+SEMESTER_PLAN_IMPORT_MAX_SCANNED_ROWS = int(
+    os.environ.get("DJANGO_SEMESTER_PLAN_IMPORT_MAX_SCANNED_ROWS", 20000)
+)
+
+
 # SimpleJWT. Token issuing endpoints are added in a later phase.
 
 SIMPLE_JWT = {

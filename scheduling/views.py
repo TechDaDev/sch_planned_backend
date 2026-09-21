@@ -10,13 +10,18 @@ service, and read through scoped, read-only viewsets.
 from dataclasses import replace
 
 from django.db.models import Count, OuterRef, Subquery
+from django.http import HttpResponse
+from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import OpenApiParameter, OpenApiResponse, extend_schema
 from rest_framework import status
 from rest_framework.decorators import action
 from rest_framework.exceptions import (
+    APIException,
+    NotFound,
     PermissionDenied,
     ValidationError as DRFValidationError,
 )
+from rest_framework.parsers import MultiPartParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -38,12 +43,14 @@ from scheduling.models import (
 )
 from scheduling.permissions import (
     CanEditScheduleDraft,
+    CanImportSemesterPlan,
     CanManageCalendarExceptions,
     CanReadPublishedAnalytics,
     CanReadScheduleData,
     CanRunCollegeScheduleGeneration,
     CanRunPreSchedulingValidation,
     CanRunScheduleWorkflow,
+    resolve_import_department,
     resolve_validation_scope,
     visible_calendar_exceptions_filter,
     visible_schedules_filter,
@@ -78,6 +85,9 @@ from scheduling.serializers import (
     ScheduleVersionDetailSerializer,
     ScheduleVersionSummarySerializer,
     ScheduleWorkflowActionSerializer,
+    SemesterPlanApplyResponseSerializer,
+    SemesterPlanImportRequestSerializer,
+    SemesterPlanValidationResponseSerializer,
     TimeSlotSerializer,
     TimeSlotWriteSerializer,
     WorkflowRejectedSerializer,
@@ -91,6 +101,22 @@ from scheduling.services.generation import (
     DepartmentScheduleGenerator,
 )
 from scheduling.services.analytics import ScheduleAnalyticsService
+from scheduling.services.exports import (
+    PDF_MEDIA_TYPE,
+    XLSX_MEDIA_TYPE,
+    ExportFontUnavailable,
+    ScheduleExportService,
+    build_pdf,
+    build_workbook,
+    content_disposition,
+    manage_version_filename,
+    published_filename,
+    template_filename,
+)
+from scheduling.services.imports import (
+    SemesterPlanImportService,
+    build_template,
+)
 from scheduling.services.manual_edit import (
     BASE_STATE_CODES,
     ManualEditChange,
@@ -524,6 +550,76 @@ def _resolve_semester_query(request):
     if semester is None:
         raise DRFValidationError({"semester": "Unknown semester."})
     return semester
+
+
+def _published_schedule_scope(request):
+    """Resolve the authoritative publication and the caller's scoped department.
+
+    Shared by the published analytics and the published export routes so all of them
+    answer identically: a semester without a publication is ``404`` (never a draft), and
+    a department-scoped caller is narrowed to its own department before anything is
+    aggregated or exported. Returns ``(semester, schedule, department)``; ``department``
+    is ``None`` for a caller with cross-department access.
+    """
+    semester = _resolve_semester_query(request)
+    schedule = current_published_college_schedule(semester=semester)
+    if schedule is None:
+        raise NotFound(
+            "No college schedule of this semester has been published yet."
+        )
+    if request.user.has_cross_department_access:
+        return semester, schedule, None
+    # Fail closed: nothing can be narrowed for an account with no department, and the
+    # whole college is out of its reach.
+    if request.user.department_id is None:
+        raise PermissionDenied(
+            "Your account is not attached to a department, so there is no official "
+            "timetable scope to analyse."
+        )
+    department = Department.objects.filter(pk=request.user.department_id).first()
+    if department is None:
+        raise PermissionDenied(
+            "Your account's department no longer exists, so there is nothing to analyse."
+        )
+    return semester, schedule, department
+
+
+def _file_response(*, filename: str, content: bytes, media_type: str) -> HttpResponse:
+    """A download response carrying already-rendered bytes.
+
+    The body is built in memory by the export layer, so a plain response is used rather
+    than a ``FileResponse``: the caller (and a test) can read the bytes directly, and
+    there is no file handle to stream or close.
+
+    The filename is built from identifiers by the export layer and re-sanitized here, so
+    a header can never be broken - or injected into - by a value that came from the
+    database.
+    """
+    response = HttpResponse(content, content_type=media_type)
+    response["Content-Disposition"] = content_disposition(filename)
+    return response
+
+
+class ExportUnavailable(APIException):
+    """HTTP mapping of a controlled export failure.
+
+    The export layer refuses to produce a document it cannot render correctly - no
+    Unicode-capable font, or a font that cannot draw a character the document contains.
+    That is an environment problem rather than a client error, so it answers ``503`` with
+    the reason instead of a document with missing glyphs.
+    """
+
+    status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    default_detail = "The export could not be generated on this host."
+    default_code = "EXPORT_UNAVAILABLE"
+
+
+def _render_pdf(document) -> bytes:
+    """Render a PDF document, turning a controlled font failure into ``503``."""
+    try:
+        return build_pdf(document)
+    except ExportFontUnavailable as exc:
+        raise ExportUnavailable(str(exc.message)) from exc
 
 
 def _version_for_response(version_id: int):
@@ -1078,6 +1174,108 @@ class ScheduleVersionViewSet(QueryParameterFilterMixin, ReadOnlyModelViewSet):
         report = ScheduleAnalyticsService.for_version(version).build()
         return Response(ScheduleAnalyticsResponseSerializer(report).data)
 
+    # --- Phase 15: exports ---------------------------------------------------
+
+    @extend_schema(
+        summary="Download one stored version as an Excel workbook",
+        description=(
+            "Returns an .xlsx workbook of this exact persisted version: the timetable "
+            "(one row per placement), the analytics summary and the department, "
+            "instructor, room, group and quality sheets.\n\n"
+            "Descriptive values come from the version's snapshot columns, so a historical "
+            "export does not change when a live course, room, department, instructor or "
+            "group is renamed. Room utilization keeps its ``utilization_basis`` label "
+            "because its denominator is today's room availability.\n\n"
+            "Every cell is written as data: a value that begins with ``=``, ``+``, ``-`` "
+            "or ``@`` is neutralized so opening the workbook cannot execute it.\n\n"
+            "Access is the same as reading this version, so an out-of-scope version "
+            "answers ``404``. The request writes nothing."
+        ),
+        responses={
+            (200, XLSX_MEDIA_TYPE): OpenApiResponse(
+                response=OpenApiTypes.BINARY,
+                description="The generated .xlsx workbook.",
+            ),
+            401: OpenApiResponse(description="Authentication required."),
+            403: OpenApiResponse(
+                description="This role may not read schedule data."
+            ),
+            404: OpenApiResponse(
+                description="Unknown version, or a version outside the caller's scope."
+            ),
+        },
+    )
+    @action(
+        detail=True,
+        methods=["get"],
+        url_path="export/xlsx",
+        permission_classes=[IsAuthenticated, CanReadScheduleData],
+    )
+    def export_xlsx(self, request, pk=None):
+        version = self.get_object()
+        document = ScheduleExportService.for_version(version).document()
+        return _file_response(
+            filename=manage_version_filename(
+                semester_id=version.schedule.semester_id,
+                version_number=document.metadata.version_number,
+                extension="xlsx",
+            ),
+            content=build_workbook(document),
+            media_type=XLSX_MEDIA_TYPE,
+        )
+
+    @extend_schema(
+        summary="Download one stored version as a PDF report",
+        description=(
+            "Returns a PDF of this exact persisted version: a title block with the "
+            "version and publication metadata, the authorized timetable as a paginated "
+            "landscape table, and a concise analytics summary.\n\n"
+            "The timetable is one flowable table, so ReportLab paginates it and no "
+            "session is dropped at a page break. Arabic and other right-to-left text is "
+            "reshaped and reordered before drawing, and the font is verified to cover "
+            "every character: when no Unicode-capable font can be resolved the endpoint "
+            "answers ``503`` instead of producing a document with missing glyphs.\n\n"
+            "Access is the same as reading this version. The request writes nothing."
+        ),
+        responses={
+            (200, PDF_MEDIA_TYPE): OpenApiResponse(
+                response=OpenApiTypes.BINARY,
+                description="The generated PDF document.",
+            ),
+            401: OpenApiResponse(description="Authentication required."),
+            403: OpenApiResponse(
+                description="This role may not read schedule data."
+            ),
+            404: OpenApiResponse(
+                description="Unknown version, or a version outside the caller's scope."
+            ),
+            503: OpenApiResponse(
+                description=(
+                    "No Unicode-capable font is available, or the resolved font cannot "
+                    "draw a character the document contains, so no document was created."
+                )
+            ),
+        },
+    )
+    @action(
+        detail=True,
+        methods=["get"],
+        url_path="export/pdf",
+        permission_classes=[IsAuthenticated, CanReadScheduleData],
+    )
+    def export_pdf(self, request, pk=None):
+        version = self.get_object()
+        document = ScheduleExportService.for_version(version).document()
+        return _file_response(
+            filename=manage_version_filename(
+                semester_id=version.schedule.semester_id,
+                version_number=document.metadata.version_number,
+                extension="pdf",
+            ),
+            content=_render_pdf(document),
+            media_type=PDF_MEDIA_TYPE,
+        )
+
     def _perform_workflow_action(self, request, action: str):
         """Run one workflow action and serialize its outcome.
 
@@ -1294,36 +1492,7 @@ class PublishedScheduleAnalyticsView(APIView):
         },
     )
     def get(self, request):
-        semester = _resolve_semester_query(request)
-        schedule = current_published_college_schedule(semester=semester)
-        if schedule is None:
-            return Response(
-                {
-                    "detail": (
-                        "No college schedule of this semester has been published yet."
-                    )
-                },
-                status=status.HTTP_404_NOT_FOUND,
-            )
-
-        department = None
-        if not request.user.has_cross_department_access:
-            # Fail closed: summaries cannot be narrowed for an account with no
-            # department, and the whole college is out of its reach.
-            if request.user.department_id is None:
-                raise PermissionDenied(
-                    "Your account is not attached to a department, so there is no "
-                    "official timetable scope to analyse."
-                )
-            department = Department.objects.filter(
-                pk=request.user.department_id
-            ).first()
-            if department is None:
-                raise PermissionDenied(
-                    "Your account's department no longer exists, so there is nothing "
-                    "to analyse."
-                )
-
+        semester, schedule, department = _published_schedule_scope(request)
         report = ScheduleAnalyticsService.for_published(
             schedule, department=department
         ).build()
@@ -1405,3 +1574,301 @@ class PublishedScheduleCurrentView(APIView):
                 }
             ).data
         )
+
+
+# --- Phase 15: published exports ---------------------------------------------
+
+
+class _PublishedExportView(APIView):
+    """Shared behaviour of the two published export routes.
+
+    Both resolve the authoritative publication and narrow a department caller's entry set
+    *before* the document is built, so a department workbook never contains the whole
+    college with a few sheets hidden. Instructors are refused: the published timetable
+    endpoint stays their source, and no export dashboard is offered to them.
+    """
+
+    permission_classes = [IsAuthenticated, CanReadPublishedAnalytics]
+
+    extension = "xlsx"
+    media_type = XLSX_MEDIA_TYPE
+
+    def build_document(self, document_source):
+        raise NotImplementedError
+
+    def get(self, request):
+        semester, schedule, department = _published_schedule_scope(request)
+        document = ScheduleExportService.for_published(
+            schedule, department=department
+        ).document()
+        return _file_response(
+            filename=published_filename(
+                semester_id=semester.pk,
+                extension=self.extension,
+                department_code=None if department is None else department.code,
+            ),
+            content=self.build_document(document),
+            media_type=self.media_type,
+        )
+
+
+@extend_schema(
+    tags=SCHEDULING_TAGS,
+    summary="Download the current published college timetable as an Excel workbook",
+    description=(
+        "Returns an .xlsx workbook of the official timetable of one semester: the "
+        "timetable sheet plus the analytics sheets of the same scoped entry set.\n\n"
+        "A college administrator receives the whole college. A department's "
+        "administrator, scheduler or viewer receives only the entries their department "
+        "manages or participates in, narrowed before the workbook is built, and the file "
+        "name names the department. An instructor is refused with ``403``.\n\n"
+        "The analysed version is the schedule's ``published_version`` pointer, never "
+        "whichever version carries ``status = PUBLISHED``. A semester without a "
+        "publication answers ``404``; nothing is generated and nothing is written."
+    ),
+    parameters=[
+        OpenApiParameter(
+            name="semester",
+            type=int,
+            location=OpenApiParameter.QUERY,
+            required=True,
+            description="Semester id whose published timetable to export.",
+        )
+    ],
+    responses={
+        (200, XLSX_MEDIA_TYPE): OpenApiResponse(
+            response=OpenApiTypes.BINARY,
+            description="The generated .xlsx workbook.",
+        ),
+        400: OpenApiResponse(description="Missing or unknown ``semester``."),
+        401: OpenApiResponse(description="Authentication required."),
+        403: OpenApiResponse(
+            description=(
+                "This role has no export access: instructors use the published timetable "
+                "endpoint, and a department-scoped account without a department fails "
+                "closed."
+            )
+        ),
+        404: OpenApiResponse(
+            description="No college schedule of this semester has been published."
+        ),
+    },
+)
+class PublishedScheduleExportXlsxView(_PublishedExportView):
+    """Published college timetable as an Excel workbook."""
+
+    extension = "xlsx"
+    media_type = XLSX_MEDIA_TYPE
+
+    def build_document(self, document):
+        return build_workbook(document)
+
+
+@extend_schema(
+    tags=SCHEDULING_TAGS,
+    summary="Download the current published college timetable as a PDF",
+    description=(
+        "Returns a PDF of the official timetable of one semester, scoped exactly like "
+        "the published Excel export: the whole college for a college administrator, that "
+        "department's official entries for a department user, and ``403`` for an "
+        "instructor.\n\n"
+        "The timetable is paginated by ReportLab rather than truncated, and right-to-left "
+        "text is shaped before drawing. When no Unicode-capable font can be resolved - or "
+        "the resolved font cannot draw a character the document contains - the endpoint "
+        "answers ``503`` instead of emitting a document with missing glyphs."
+    ),
+    parameters=[
+        OpenApiParameter(
+            name="semester",
+            type=int,
+            location=OpenApiParameter.QUERY,
+            required=True,
+            description="Semester id whose published timetable to export.",
+        )
+    ],
+    responses={
+        (200, PDF_MEDIA_TYPE): OpenApiResponse(
+            response=OpenApiTypes.BINARY,
+            description="The generated PDF document.",
+        ),
+        400: OpenApiResponse(description="Missing or unknown ``semester``."),
+        401: OpenApiResponse(description="Authentication required."),
+        403: OpenApiResponse(description="This role has no export access."),
+        404: OpenApiResponse(
+            description="No college schedule of this semester has been published."
+        ),
+        503: OpenApiResponse(
+            description="No Unicode-capable font is available for this document."
+        ),
+    },
+)
+class PublishedScheduleExportPdfView(_PublishedExportView):
+    """Published college timetable as a PDF report."""
+
+    extension = "pdf"
+    media_type = PDF_MEDIA_TYPE
+
+    def build_document(self, document):
+        return _render_pdf(document)
+
+
+# --- Phase 15: semester teaching plan import ---------------------------------
+
+
+class SemesterPlanTemplateView(APIView):
+    """The downloadable semester teaching plan template.
+
+    The template is generated from the same schema constants the reader enforces and
+    contains no schedule data, so it is safe for a department administrator to download
+    before knowing anything about the semester. The data sheets are empty; the examples
+    live in the README sheet as documentation.
+    """
+
+    permission_classes = [IsAuthenticated, CanImportSemesterPlan]
+
+    @extend_schema(
+        tags=SCHEDULING_TAGS,
+        summary="Download the semester teaching plan import template",
+        description=(
+            "Returns the .xlsx template for the semester teaching plan import: a README "
+            "sheet documenting every sheet and column, plus the eight data sheets with "
+            "their headers and no rows.\n\n"
+            "Uploading the untouched template validates to zero rows and applies "
+            "nothing."
+        ),
+        responses={
+            (200, XLSX_MEDIA_TYPE): OpenApiResponse(
+                response=OpenApiTypes.BINARY,
+                description="The .xlsx template.",
+            ),
+            401: OpenApiResponse(description="Authentication required."),
+            403: OpenApiResponse(
+                description=(
+                    "Only college administrators and department administrators may "
+                    "import a teaching plan."
+                )
+            ),
+        },
+    )
+    def get(self, request):
+        return _file_response(
+            filename=template_filename(),
+            content=build_template(),
+            media_type=XLSX_MEDIA_TYPE,
+        )
+
+
+class _SemesterPlanImportView(APIView):
+    """Shared plumbing of the validate and apply endpoints.
+
+    Authorization happens in this order, before any spreadsheet content is examined: the
+    role gate, then the body's department and semester, then the department scope rule.
+    The workbook is only read afterwards, so a department-scoped caller cannot use a
+    malformed workbook to probe another department.
+    """
+
+    permission_classes = [IsAuthenticated, CanImportSemesterPlan]
+    #: The only endpoints in the API that accept multipart/form-data. The project-wide
+    #: parser setting stays JSON-only, so every other endpoint still rejects a form body.
+    parser_classes = [MultiPartParser]
+
+    def build_service(self, request) -> SemesterPlanImportService:
+        serializer = SemesterPlanImportRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        department = Department.objects.filter(
+            pk=serializer.validated_data["department"]
+        ).first()
+        if department is None:
+            raise DRFValidationError({"department": "Unknown department."})
+        semester = Semester.objects.filter(
+            pk=serializer.validated_data["semester"]
+        ).first()
+        if semester is None:
+            raise DRFValidationError({"semester": "Unknown semester."})
+        resolve_import_department(request.user, department=department)
+        return SemesterPlanImportService(
+            user=request.user,
+            department=department,
+            semester=semester,
+            upload=serializer.validated_data["file"],
+        )
+
+
+@extend_schema(tags=SCHEDULING_TAGS)
+class SemesterPlanValidateView(_SemesterPlanImportView):
+    @extend_schema(
+        summary="Validate a semester teaching plan workbook",
+        description=(
+            "Reads a multipart ``.xlsx`` workbook and reports every problem it finds: "
+            "unknown or missing sheets and headers, references that do not resolve, "
+            "values the academic models reject, duplicate rows and objects that already "
+            "exist.\n\n"
+            "This endpoint creates **zero** database rows, so it can be called as often as "
+            "needed. A workbook is valid when it reports no ``ERROR``; ``WARNING`` issues "
+            "do not block an apply. Issues are ordered by sheet, row, column and code, so "
+            "repeating a validation returns the same list.\n\n"
+            "The import is create-only and never overwrites an existing course, group or "
+            "offering, and it never modifies instructors, rooms, sharing, availability, "
+            "calendar data or the timetable."
+        ),
+        request={"multipart/form-data": SemesterPlanImportRequestSerializer},
+        responses={
+            200: SemesterPlanValidationResponseSerializer,
+            400: OpenApiResponse(
+                description="Unknown department or semester, or a missing file."
+            ),
+            401: OpenApiResponse(description="Authentication required."),
+            403: OpenApiResponse(
+                description="This role may not import, or has no department to import for."
+            ),
+        },
+    )
+    def post(self, request):
+        service = self.build_service(request)
+        validation = service.validate()
+        return Response(
+            SemesterPlanValidationResponseSerializer(validation.as_dict()).data
+        )
+
+
+@extend_schema(tags=SCHEDULING_TAGS)
+class SemesterPlanApplyView(_SemesterPlanImportView):
+    @extend_schema(
+        summary="Import a semester teaching plan workbook",
+        description=(
+            "Re-reads and fully re-validates the workbook against current database state "
+            "and then writes the whole plan in one transaction. A validation response from "
+            "an earlier request is never trusted.\n\n"
+            "When anything blocks, nothing at all is written and the request answers "
+            "``400`` with the blocking issues. The import creates courses, student groups, "
+            "offerings, teaching components, group links, teaching assignments and room "
+            "requirements for the authorized department and the requested semester only: "
+            "it never creates instructors, rooms, room types, capabilities, programs, "
+            "stages, sharing, calendar data, schedules or versions."
+        ),
+        request={"multipart/form-data": SemesterPlanImportRequestSerializer},
+        responses={
+            200: SemesterPlanApplyResponseSerializer,
+            400: OpenApiResponse(
+                response=SemesterPlanApplyResponseSerializer,
+                description=(
+                    "The workbook was refused and nothing was written, or the request "
+                    "itself was invalid."
+                ),
+            ),
+            401: OpenApiResponse(description="Authentication required."),
+            403: OpenApiResponse(description="This role may not import."),
+        },
+    )
+    def post(self, request):
+        service = self.build_service(request)
+        application = service.apply()
+        body = application.as_dict(
+            department=service.department, semester=service.semester
+        )
+        if not application.applied:
+            return Response(
+                SemesterPlanApplyResponseSerializer(body).data,
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return Response(SemesterPlanApplyResponseSerializer(body).data)
