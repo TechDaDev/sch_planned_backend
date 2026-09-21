@@ -240,9 +240,16 @@ SPECTACULAR_SETTINGS = {
         {
             "name": "scheduling",
             "description": (
-                "Pre-scheduling validation: computed readiness checks that report "
-                "what would block timetable generation."
+                "Pre-scheduling validation, generation previews and persisted "
+                "schedule drafts: readiness checks, department and college-wide "
+                "generation, and the read APIs for schedules, versions and entries."
             ),
         },
     ],
+    # Two independent choice sets share the field name ``status`` (the solver's
+    # outcome and a schedule version's lifecycle), so the version one is named here
+    # instead of leaving drf-spectacular to invent a name for it.
+    "ENUM_NAME_OVERRIDES": {
+        "ScheduleStatusEnum": "scheduling.models.ScheduleStatus.choices",
+    },
 }

@@ -48,18 +48,21 @@ sch_planner_backend/
 │   ├── views.py       # viewsets + /api/me/teaching-assignments/
 │   ├── urls.py        # /api/instructors/, /api/rooms/, ...
 │   └── migrations/    # 0001_initial, 0002_rooms_and_requirements
-├── scheduling/        # calendar, time configuration, validation and solver
+├── scheduling/        # calendar, time configuration, solver and persistence
 │   ├── models.py      # WorkingDay, TimeSlot, BreakPeriod, CalendarException,
-│   │                  # ExceptionType, ExceptionScope
+│   │                  # Schedule, ScheduleVersion, ScheduleEntry and its slot,
+│   │                  # instructor and student-group snapshot children
 │   ├── services/      # domain logic kept out of the views
 │   │   ├── validation/# issues, time_grid, resources, validator
 │   │   ├── solver/    # domain, validator, model_builder, solver, result
-│   │   └── generation/# blocks, candidates, preferences, preview, service
-│   ├── permissions.py # calendar visibility and validation scope rules
-│   ├── serializers.py # resource, validation and generation contracts
-│   ├── views.py       # time-grid viewsets + validation and generation endpoints
-│   ├── urls.py        # /api/working-days/, /api/scheduling/generate/, ...
-│   └── migrations/    # 0001_calendar_and_time_configuration
+│   │   ├── generation/# blocks, candidates, preferences, preview, service
+│   │   └── persistence/# snapshots, service (version history writer)
+│   ├── permissions.py # calendar visibility, validation scope, schedule read scope
+│   ├── serializers.py # resource, validation, generation and persistence contracts
+│   ├── views.py       # time-grid viewsets, generation endpoints, schedule read APIs
+│   ├── urls.py        # /api/working-days/, /api/scheduling/generate/, /api/schedules/
+│   └── migrations/    # 0001_calendar_and_time_configuration,
+│                      # 0002_schedule_persistence
 ├── reports/           # report exports (empty until later phases)
 ├── tests/             # pytest suite for the whole project
 ├── manage.py
@@ -180,6 +183,9 @@ All resource APIs expose the same five operations — `GET` list, `GET` detail,
 | Scheduling validation     | `POST /api/scheduling/validate/`   | see the validation section below       |
 | Department generation     | `POST /api/scheduling/generate/`   | own department (college admin: any)    |
 | College generation        | `POST /api/scheduling/generate-college/` | college administrator or superuser only |
+| Department draft          | `POST /api/schedules/generate-department-draft/` | own department (college admin: any) |
+| College draft             | `POST /api/schedules/generate-college-draft/` | college administrator or superuser only |
+| Schedule reads            | `GET /api/schedules/`, `/api/schedule-versions/` | college admin, or own-department drafts |
 
 Write ownership in this table is stricter than read visibility for shared
 resources: shared instructors and rooms are readable by the departments they are
@@ -1325,6 +1331,160 @@ versioning arrive in Phase 11.
 - no new soft constraints beyond instructor preference penalties;
 - no reports or Excel/PDF export, no background jobs, no Railway configuration.
 
+## Schedule persistence and versioning
+
+```
+POST /api/schedules/generate-department-draft/
+POST /api/schedules/generate-college-draft/
+
+GET  /api/schedules/
+GET  /api/schedules/{id}/
+GET  /api/schedules/{id}/versions/
+GET  /api/schedule-versions/{id}/
+GET  /api/schedule-versions/{id}/entries/
+```
+
+Phase 11 stores generated timetables as version history:
+
+```
+Schedule
+  ├── ScheduleVersion 1  (DRAFT)
+  │     ├── ScheduleEntry
+  │     │     ├── ScheduleEntryTimeSlot
+  │     │     ├── ScheduleEntryInstructor
+  │     │     └── ScheduleEntryStudentGroup
+  │     └── ...
+  └── ScheduleVersion 2  (DRAFT, parent = version 1)
+```
+
+`Schedule` is the logical timetable of one semester and one scope. `ScheduleVersion`
+is one immutable generated snapshot. `ScheduleEntry` is one persisted weekly session,
+and its three child tables record the exact periods, instructors and student groups
+that session had when it was generated.
+
+### Scope
+
+`ScheduleScope` is a model-level choice set, not a serializer enum, and the database
+enforces the combination:
+
+- `DEPARTMENT` requires `department`;
+- `COLLEGE` requires `department` to be null;
+- one department schedule per semester and department, one college schedule per
+  semester.
+
+Regenerating therefore appends a version to the same logical schedule instead of
+creating a second one. Department schedules and the college schedule of a semester
+are separate objects.
+
+### Version numbering, lineage and immutability
+
+`version_number` starts at 1 and is unique per schedule. The next persisted
+generation takes the previous latest version plus one, and stores it in
+`parent_version`; version 1 has no parent. A parent must belong to the same schedule,
+which the model checks as well as the service.
+
+A stored version is never modified: no `PUT`, `PATCH` or `DELETE` exists for
+versions, entries or their children, creating an entry through the API is refused,
+and a schedule cannot be deleted through the API at all. History grows only by
+appending.
+
+Every version created here is `DRAFT`. The remaining lifecycle values
+(`SUBMITTED`, `REVIEWED`, `APPROVED`, `PUBLISHED`) exist so the workflow phases can
+add transitions without a data migration; no transition, approval or publication
+exists yet, and a client cannot choose a status.
+
+### The generate-and-persist endpoints
+
+Both endpoints generate **server-side** with the verified Phase 9 and Phase 10
+pipelines and then store that result. An allowed body is small:
+
+```json
+{ "semester": 3, "department": 2, "max_time_seconds": 30, "notes": "initial" }
+{ "semester": 3, "max_time_seconds": 60, "notes": "college-wide" }
+```
+
+Unknown fields are rejected with `400` rather than ignored, so `placements`,
+`reservations`, `status`, `version_number` and (college) `department`/`scope` cannot
+look like they were applied. There is deliberately no way to POST placements: a
+client cannot bypass instructor, room, group, availability, sharing or CP-SAT
+constraints, because the server generates the timetable it stores.
+
+Authorization matches the preview endpoints: college administrators draft any
+department, department administrators and schedulers their own, and the college-wide
+draft is limited to college administrators and superusers.
+
+### Nothing is stored unless the run succeeded
+
+A version is written only when the generation reported success, the solver returned
+`OPTIMAL` or `FEASIBLE`, and exactly one placement exists for every required
+session. Otherwise:
+
+- a Phase 7 gate failure answers `409` with `PRE_SCHEDULING_VALIDATION_FAILED`;
+- a session without a single candidate answers `409` with `CANDIDATE_BUILD_FAILED`;
+- an infeasible or timed-out solve answers `200` with `generated: false`;
+- a result that looks successful but is structurally short, or whose placements fall
+  outside the schedule's scope, answers `409` with `GENERATION_RESULT_INCOMPLETE`.
+
+None of these writes a row: no empty draft, no partial version. The writes for one
+version share a single short `transaction.atomic()` block, and the CP-SAT solve
+happens before that block opens, so no row lock is ever held for the length of a
+solve. Version numbers are allocated under `select_for_update()` on the schedule row,
+with the unique constraint as the final guard, which is safe on SQLite today and on
+PostgreSQL later.
+
+### Preview endpoints stay preview-only
+
+`POST /api/scheduling/generate/` and `POST /api/scheduling/generate-college/` still
+return `"persisted": false` and write nothing. Generating a draft is an explicit,
+separate request.
+
+### Snapshots
+
+A version records what the timetable looked like when it was generated. Alongside the
+live foreign keys, every entry keeps snapshot columns for the course, offering,
+teaching component, managing department and room, and its child rows keep the period
+labels, instructor names with their assignment role, and student-group codes, names
+and owning department. Renaming a course, room, department, instructor or group later
+does not change what a stored version renders, and a joint course keeps the foreign
+departments' groups as they were.
+
+### Reading
+
+- College administrators and superusers read every schedule, version and entry.
+- A department's `DEPARTMENT_ADMIN`, `SCHEDULER` and `VIEWER` read that department's
+  own drafts; another department's draft answers `404`.
+- The college-wide draft stays with college administrators until a later workflow
+  publishes timetables; department users do not read it.
+- `INSTRUCTOR` has no administrative schedule access in this phase.
+- A department-scoped user without a department sees nothing, and participating in
+  another department's joint course grants no draft access.
+
+List and detail responses carry version counts and the latest version number and
+status from annotations, version lists are newest first, and entries are served from
+the version's snapshot columns. Optional exact-match entry filters
+(`managing_department`, `teaching_component`, `room`, `day_of_week`) narrow the
+authorized queryset and can never widen it.
+
+### Not in Phase 11
+
+- no workflow transitions, `SUBMIT`, `REVIEW`, `APPROVE` or `PUBLISH` endpoint;
+- no manual editing, entry swapping or change requests;
+- no audit log, reports, PDF/Excel export or Flutter work;
+- no reservations built from drafts;
+- no Railway configuration.
+
+### Architecture
+
+```
+scheduling/services/persistence/
+├── snapshots.py   # preview placement -> frozen entry snapshots (pure)
+└── service.py     # verify, allocate version number, write one version atomically
+```
+
+The generation pipeline stays read-only and knows nothing about persistence; the
+solver package knows nothing about either. The persistence service is the only writer
+of version history.
+
 ## Who may write what
 
 | Role | Reads | Writes |
@@ -1411,10 +1571,14 @@ not used.
 - **Phase 10 (done)** — college-wide generation: one CP-SAT problem covering every
   department of the semester, with shared instructors, shared rooms and joint
   student groups constrained globally. College administrators only, preview only.
-- **Phase 11 (planned)** — `Schedule`/`ScheduleVersion`/`ScheduleEntry` persistence
-  and versioning.
-- **Later** — approval and publication, manual editing, reports/export,
-  reservations and department regeneration from an authoritative version,
-  PostgreSQL, background jobs, Railway deployment.
+- **Phase 11 (done)** — schedule persistence and versioning: `Schedule`,
+  `ScheduleVersion`, `ScheduleEntry` and the snapshot child tables, an explicit
+  generate-and-persist endpoint per scope, and read-only history APIs. Drafts only,
+  nothing published.
+- **Phase 12 (planned)** — workflow transitions and publication over the stored
+  versions.
+- **Later** — manual editing, reports/export, reservations and department
+  regeneration from an authoritative version, PostgreSQL, background jobs, Railway
+  deployment.
 - **Flutter instructor app** — after the web application, using
   `/api/me/teaching-assignments/` as one of its first endpoints.

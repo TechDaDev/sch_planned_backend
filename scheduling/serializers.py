@@ -35,6 +35,12 @@ from scheduling.models import (
     BreakPeriod,
     CalendarException,
     ExceptionScope,
+    Schedule,
+    ScheduleEntry,
+    ScheduleScope,
+    ScheduleStatus,
+    ScheduleVersion,
+    ScheduleVersionSource,
     TimeSlot,
     WorkingDay,
 )
@@ -49,6 +55,31 @@ MAX_GENERATION_TIME_SECONDS = 120
 DEFAULT_COLLEGE_GENERATION_TIME_SECONDS = 60
 MIN_COLLEGE_GENERATION_TIME_SECONDS = 1
 MAX_COLLEGE_GENERATION_TIME_SECONDS = 300
+
+#: Longest note a caller may attach to a persisted schedule version.
+SCHEDULE_NOTES_MAX_LENGTH = 2000
+
+
+class StrictFieldValidationMixin:
+    """Reject request fields the serializer does not define.
+
+    The API elsewhere ignores unknown fields, following the DRF default. The
+    endpoints that create state deliberately do not: a silently ignored field looks
+    like it was honoured, and for schedule endpoints that could mean a scope or a
+    solver control the caller believes in but the server never applied.
+    """
+
+    def to_internal_value(self, data):
+        if hasattr(data, "keys"):
+            unknown = sorted(set(data.keys()) - set(self.fields))
+            if unknown:
+                raise serializers.ValidationError(
+                    {
+                        field: "This endpoint does not accept this field."
+                        for field in unknown
+                    }
+                )
+        return super().to_internal_value(data)
 
 
 class WorkingDaySummarySerializer(serializers.ModelSerializer):
@@ -635,7 +666,9 @@ class GenerationRejectedSerializer(serializers.Serializer):
 # --- Phase 10: college-wide schedule generation ----------------------------
 
 
-class CollegeScheduleGenerationInputSerializer(serializers.Serializer):
+class CollegeScheduleGenerationInputSerializer(
+    StrictFieldValidationMixin, serializers.Serializer
+):
     """Request body of ``POST /api/scheduling/generate-college/``.
 
     The scope is the endpoint itself, so there is no ``scope`` or ``department``
@@ -666,24 +699,6 @@ class CollegeScheduleGenerationInputSerializer(serializers.Serializer):
             "normal."
         ),
     )
-
-    def to_internal_value(self, data):
-        """Reject any field this endpoint does not define.
-
-        ``department`` and ``scope`` matter most: both would imply a scope the
-        endpoint does not have. Solver controls do not exist either, because the
-        engine options are fixed for reproducibility.
-        """
-        if hasattr(data, "keys"):
-            unknown = sorted(set(data.keys()) - set(self.fields))
-            if unknown:
-                raise serializers.ValidationError(
-                    {
-                        field: "This endpoint does not accept this field."
-                        for field in unknown
-                    }
-                )
-        return super().to_internal_value(data)
 
 
 class GenerationDepartmentBuildCountSerializer(serializers.Serializer):
@@ -791,3 +806,335 @@ class CollegeGenerationRejectedSerializer(serializers.Serializer):
     diagnostics = CollegeGenerationDiagnosticsSerializer(
         allow_null=True, required=False
     )
+
+
+# --- Phase 11: persisted schedules, versions and entries --------------------
+
+
+class ScheduleDraftDepartmentInputSerializer(
+    StrictFieldValidationMixin, serializers.Serializer
+):
+    """Request body of ``POST /api/schedules/generate-department-draft/``.
+
+    The server generates the timetable itself with the Phase 9 pipeline and stores
+    that result. A caller supplies what to schedule and a note, never placements:
+    accepting client placements would let a request bypass instructor, room, group,
+    availability, sharing and CP-SAT constraints. Unsupported fields are rejected
+    rather than ignored, so ``placements``, ``status`` or ``version_number`` cannot
+    look like they were applied.
+    """
+
+    semester = serializers.PrimaryKeyRelatedField(queryset=Semester.objects.all())
+    department = serializers.PrimaryKeyRelatedField(queryset=Department.objects.all())
+    max_time_seconds = serializers.IntegerField(
+        required=False,
+        default=DEFAULT_MAX_TIME_SECONDS,
+        min_value=MIN_GENERATION_TIME_SECONDS,
+        max_value=MAX_GENERATION_TIME_SECONDS,
+        help_text="Solver time limit in seconds for the generation that is stored.",
+    )
+    notes = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        default="",
+        max_length=SCHEDULE_NOTES_MAX_LENGTH,
+        help_text="Free-text note stored on the created draft version.",
+    )
+
+
+class ScheduleDraftCollegeInputSerializer(
+    StrictFieldValidationMixin, serializers.Serializer
+):
+    """Request body of ``POST /api/schedules/generate-college-draft/``.
+
+    College scope is the endpoint, so ``department`` and ``scope`` are unsupported
+    fields and are rejected; so are ``placements``, ``reservations``, ``status`` and
+    ``version_number``.
+    """
+
+    semester = serializers.PrimaryKeyRelatedField(queryset=Semester.objects.all())
+    max_time_seconds = serializers.IntegerField(
+        required=False,
+        default=DEFAULT_COLLEGE_GENERATION_TIME_SECONDS,
+        min_value=MIN_COLLEGE_GENERATION_TIME_SECONDS,
+        max_value=MAX_COLLEGE_GENERATION_TIME_SECONDS,
+        help_text="Solver time limit in seconds for the generation that is stored.",
+    )
+    notes = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        default="",
+        max_length=SCHEDULE_NOTES_MAX_LENGTH,
+        help_text="Free-text note stored on the created draft version.",
+    )
+
+
+class ScheduleUserSummarySerializer(serializers.Serializer):
+    """Shallow account summary of whoever created a schedule or a version."""
+
+    id = serializers.IntegerField()
+    username = serializers.CharField()
+    role = serializers.CharField()
+
+
+class ScheduleIdentitySerializer(serializers.Serializer):
+    """What a schedule is: its semester and its scope."""
+
+    id = serializers.IntegerField()
+    scope = serializers.ChoiceField(choices=ScheduleScope.choices)
+    semester = SemesterSummarySerializer()
+    department = DepartmentSummarySerializer(allow_null=True, required=False)
+
+
+class ScheduleVersionSummarySerializer(serializers.Serializer):
+    """One version row as lists and details show it.
+
+    ``entry_count`` comes from an annotation on the queryset so a version list does
+    not query per row; the detail path and the draft response annotate it too.
+    """
+
+    id = serializers.IntegerField()
+    version_number = serializers.IntegerField()
+    status = serializers.ChoiceField(choices=ScheduleStatus.choices)
+    source = serializers.ChoiceField(choices=ScheduleVersionSource.choices)
+    parent_version = serializers.IntegerField(
+        source="parent_version_id", allow_null=True, required=False
+    )
+    created_by = ScheduleUserSummarySerializer(allow_null=True, required=False)
+    notes = serializers.CharField(allow_blank=True, required=False)
+    solver_status = serializers.CharField(allow_blank=True, required=False)
+    objective_value = serializers.IntegerField(allow_null=True, required=False)
+    entry_count = serializers.SerializerMethodField()
+    created_at = serializers.DateTimeField()
+
+    def get_entry_count(self, obj) -> int:
+        annotated = getattr(obj, "entry_count", None)
+        if annotated is not None:
+            return annotated
+        return obj.entries.count()
+
+
+class ScheduleSummarySerializer(ScheduleIdentitySerializer):
+    """One logical schedule as the collection shows it.
+
+    ``version_count`` and the latest version fields are annotations, so a list of
+    schedules costs one query regardless of how much history each one has.
+    """
+
+    version_count = serializers.SerializerMethodField()
+    latest_version_number = serializers.SerializerMethodField()
+    latest_version_status = serializers.SerializerMethodField()
+    created_at = serializers.DateTimeField()
+    updated_at = serializers.DateTimeField()
+
+    def get_version_count(self, obj) -> int:
+        annotated = getattr(obj, "version_count", None)
+        if annotated is not None:
+            return annotated
+        return obj.versions.count()
+
+    def get_latest_version_number(self, obj) -> int | None:
+        return getattr(obj, "latest_version_number", None)
+
+    def get_latest_version_status(self, obj) -> str | None:
+        return getattr(obj, "latest_version_status", None)
+
+
+class ScheduleDetailSerializer(ScheduleSummarySerializer):
+    """One logical schedule with a summary of its newest version.
+
+    The full history is served by ``/api/schedules/{id}/versions/`` and the entries
+    of a version by ``/api/schedule-versions/{id}/entries/``, so this response stays
+    a timetable *identity*, not a timetable.
+    """
+
+    latest_version = serializers.SerializerMethodField()
+
+    def get_latest_version(self, obj) -> dict | None:
+        version = getattr(obj, "latest_version_obj", None)
+        if version is None:
+            return None
+        return ScheduleVersionSummarySerializer(version).data
+
+
+class ScheduleVersionDetailSerializer(ScheduleVersionSummarySerializer):
+    """One version with its full generation provenance.
+
+    Entries are not nested: they are served by the version's ``entries`` action.
+    """
+
+    schedule = ScheduleIdentitySerializer()
+    solver_wall_time_seconds = serializers.FloatField(allow_null=True, required=False)
+    solver_num_conflicts = serializers.IntegerField(allow_null=True, required=False)
+    solver_num_branches = serializers.IntegerField(allow_null=True, required=False)
+    validation_summary = serializers.DictField(required=False)
+    generation_summary = serializers.DictField(required=False)
+
+
+class ScheduleEntryTimeSlotSerializer(serializers.Serializer):
+    """One occupied period of an entry, rendered from its snapshot columns."""
+
+    id = serializers.IntegerField(source="time_slot_id")
+    position = serializers.IntegerField()
+    sequence = serializers.IntegerField(source="sequence_snapshot")
+    label = serializers.CharField(
+        source="label_snapshot", allow_blank=True, required=False
+    )
+    start_time = serializers.TimeField(source="start_time_snapshot", format="%H:%M")
+    end_time = serializers.TimeField(source="end_time_snapshot", format="%H:%M")
+
+
+class ScheduleEntryInstructorSerializer(serializers.Serializer):
+    """One instructor of an entry, rendered from its snapshot columns."""
+
+    id = serializers.IntegerField(source="instructor_id")
+    full_name = serializers.CharField(source="full_name_snapshot")
+    assignment_role = serializers.CharField(
+        source="assignment_role_snapshot", allow_blank=True, required=False
+    )
+
+
+class ScheduleEntryStudentGroupSerializer(serializers.Serializer):
+    """One student group of an entry, including its own department snapshot."""
+
+    id = serializers.IntegerField(source="student_group_id")
+    code = serializers.CharField(source="code_snapshot")
+    name = serializers.CharField(source="name_snapshot")
+    department = serializers.SerializerMethodField()
+
+    def get_department(self, obj) -> dict | None:
+        if obj.department_id_snapshot is None:
+            return None
+        return {
+            "id": obj.department_id_snapshot,
+            "code": obj.department_code_snapshot,
+            "name": obj.department_name_snapshot,
+        }
+
+
+class ScheduleEntrySerializer(serializers.Serializer):
+    """One persisted weekly session, rendered from its snapshot columns.
+
+    Every display value comes from the row itself, not from the live course, room,
+    department, instructor or group, so renaming any of them later cannot rewrite
+    what a stored version shows.
+    """
+
+    id = serializers.IntegerField()
+    session_id = serializers.CharField()
+    candidate_id = serializers.CharField()
+    session_ordinal = serializers.IntegerField()
+    course = serializers.SerializerMethodField()
+    offering = serializers.SerializerMethodField()
+    teaching_component = serializers.SerializerMethodField()
+    managing_department = serializers.SerializerMethodField()
+    day_of_week = serializers.IntegerField()
+    day_display = serializers.SerializerMethodField()
+    start_time = serializers.TimeField(format="%H:%M")
+    end_time = serializers.TimeField(format="%H:%M")
+    time_slots = ScheduleEntryTimeSlotSerializer(many=True)
+    room = serializers.SerializerMethodField()
+    instructors = ScheduleEntryInstructorSerializer(many=True)
+    student_groups = ScheduleEntryStudentGroupSerializer(many=True)
+    penalty = serializers.IntegerField()
+
+    def get_course(self, obj) -> dict:
+        return {
+            "id": obj.course_id_snapshot,
+            "code": obj.course_code_snapshot,
+            "name": obj.course_name_snapshot,
+        }
+
+    def get_offering(self, obj) -> dict:
+        return {
+            "id": obj.offering_id_snapshot,
+            "offering_code": obj.offering_code_snapshot,
+        }
+
+    def get_teaching_component(self, obj) -> dict:
+        return {
+            "id": obj.teaching_component_id,
+            "component_type": obj.component_type_snapshot,
+            "label": obj.component_label_snapshot,
+        }
+
+    def get_managing_department(self, obj) -> dict:
+        return {
+            "id": obj.managing_department_id,
+            "code": obj.managing_department_code_snapshot,
+            "name": obj.managing_department_name_snapshot,
+        }
+
+    def get_day_display(self, obj) -> str:
+        try:
+            return Weekday(obj.day_of_week).label
+        except ValueError:
+            return str(obj.day_of_week)
+
+    def get_room(self, obj) -> dict | None:
+        if obj.room_id is None:
+            return None
+        return {
+            "id": obj.room_id,
+            "code": obj.room_code_snapshot,
+            "name": obj.room_name_snapshot,
+        }
+
+
+class ScheduleDraftResponseSerializer(serializers.Serializer):
+    """Response body of a department draft request.
+
+    ``persisted`` is true only when a complete generation was stored as a new
+    version. A run that completed without a timetable answers ``200`` with
+    ``generated: false`` and ``persisted: false``, and a rejected run answers ``409``
+    with nothing written.
+    """
+
+    generated = serializers.BooleanField()
+    persisted = serializers.BooleanField()
+    scope = serializers.ChoiceField(choices=ScheduleScope.choices)
+    message = serializers.CharField(allow_blank=True, required=False)
+    semester = ValidationSemesterSerializer()
+    department = DepartmentSummarySerializer(allow_null=True, required=False)
+    validation = PreSchedulingValidationResponseSerializer(required=False)
+    solver = GenerationSolverSerializer(allow_null=True, required=False)
+    summary = GenerationSummarySerializer(allow_null=True, required=False)
+    schedule = ScheduleSummarySerializer(allow_null=True, required=False)
+    version = ScheduleVersionSummarySerializer(allow_null=True, required=False)
+    placements = GenerationPlacementSerializer(many=True, required=False)
+    generation_issues = ValidationIssueSerializer(many=True, required=False)
+    diagnostics = GenerationDiagnosticsSerializer(allow_null=True, required=False)
+
+
+class CollegeScheduleDraftResponseSerializer(ScheduleDraftResponseSerializer):
+    """Response body of a college draft request.
+
+    College placements additionally name their managing department, and the summary
+    counts departments, matching the college preview.
+    """
+
+    summary = CollegeGenerationSummarySerializer(allow_null=True, required=False)
+    placements = CollegeGenerationPlacementSerializer(many=True, required=False)
+    diagnostics = CollegeGenerationDiagnosticsSerializer(
+        allow_null=True, required=False
+    )
+
+
+class ScheduleDraftRejectedSerializer(serializers.Serializer):
+    """Response body of a draft request that stored nothing.
+
+    ``reason`` is one of ``PRE_SCHEDULING_VALIDATION_FAILED``,
+    ``CANDIDATE_BUILD_FAILED`` or ``GENERATION_RESULT_INCOMPLETE``. In every case
+    zero versions and zero entries exist afterwards.
+    """
+
+    generated = serializers.BooleanField()
+    persisted = serializers.BooleanField()
+    scope = serializers.ChoiceField(choices=ScheduleScope.choices)
+    reason = serializers.CharField()
+    message = serializers.CharField(allow_blank=True, required=False)
+    semester = ValidationSemesterSerializer()
+    department = DepartmentSummarySerializer(allow_null=True, required=False)
+    validation = PreSchedulingValidationResponseSerializer(allow_null=True, required=False)
+    generation_issues = ValidationIssueSerializer(many=True, required=False)
+    diagnostics = GenerationDiagnosticsSerializer(allow_null=True, required=False)

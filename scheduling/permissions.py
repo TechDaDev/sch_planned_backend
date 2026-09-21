@@ -24,6 +24,13 @@ user without a department fails closed.
 Phase 10 adds the college-wide generation gate: scheduling every department at once
 is a college-level act, so ``COLLEGE_ADMIN`` and superusers may run it and nobody
 else can reach it through this API.
+
+Phase 11 adds persisted schedule drafts. Reading one is an administrative act, not
+a teaching convenience: college administrators see every schedule, a department's
+own users see that department's drafts, college-wide drafts stay with college
+administrators until a later workflow publishes them, and ``INSTRUCTOR`` gets no
+administrative access at all. A department user without a department fails closed,
+and joint participation in another department's course grants no draft visibility.
 """
 
 from django.db import models
@@ -33,7 +40,7 @@ from rest_framework.permissions import SAFE_METHODS, BasePermission
 from accounts.models import UserRole
 from accounts.permissions import is_authenticated_active_user
 from resources.permissions import instructor_sharing_q, room_sharing_q
-from scheduling.models import ExceptionScope
+from scheduling.models import ExceptionScope, ScheduleScope
 from scheduling.services.validation import ValidationScope
 
 
@@ -144,6 +151,57 @@ class CanRunCollegeScheduleGeneration(BasePermission):
         return request.user.has_cross_department_access
 
 
+#: Roles that may read persisted schedule drafts and their version history.
+#: ``INSTRUCTOR`` is deliberately absent: instructor-facing timetables belong to the
+#: publication workflow, not to draft administration.
+SCHEDULE_READ_ROLES = frozenset(
+    {
+        UserRole.COLLEGE_ADMIN,
+        UserRole.DEPARTMENT_ADMIN,
+        UserRole.SCHEDULER,
+        UserRole.VIEWER,
+    }
+)
+
+
+def can_read_schedule_data(user) -> bool:
+    """True when the user's role may read persisted schedule drafts at all."""
+    return bool(user.is_superuser or user.role in SCHEDULE_READ_ROLES)
+
+
+def visible_schedules_filter(user) -> models.Q:
+    """Which persisted schedules a user may read.
+
+    College administrators and superusers read everything. A department user reads
+    that department's own drafts only: the college-wide draft stays with college
+    administrators, another department's draft stays out of reach, and a user
+    without a department sees nothing. Joint participation in another department's
+    course grants no draft access, because participation is not schedule-management
+    authority.
+    """
+    if user.has_cross_department_access:
+        return models.Q()
+    if user.department_id is None or not can_read_schedule_data(user):
+        return models.Q(pk__in=[])
+    return models.Q(
+        scope=ScheduleScope.DEPARTMENT, department_id=user.department_id
+    )
+
+
+class CanReadScheduleData(BasePermission):
+    """Role gate for the persisted schedule, version and entry read APIs.
+
+    The role decides whether the APIs are reachable at all; which rows come back is
+    decided by :func:`visible_schedules_filter`, so an out-of-scope schedule answers
+    ``404`` instead of advertising its existence.
+    """
+
+    def has_permission(self, request, view) -> bool:
+        if not is_authenticated_active_user(request):
+            return False
+        return can_read_schedule_data(request.user)
+
+
 def resolve_validation_scope(user, *, scope, department):
     """Authorize a validation request and return the department to validate.
 
@@ -184,9 +242,13 @@ def resolve_validation_scope(user, *, scope, department):
 
 
 __all__ = [
+    "SCHEDULE_READ_ROLES",
     "CanManageCalendarExceptions",
+    "CanReadScheduleData",
     "CanRunCollegeScheduleGeneration",
     "CanRunPreSchedulingValidation",
+    "can_read_schedule_data",
     "resolve_validation_scope",
     "visible_calendar_exceptions_filter",
+    "visible_schedules_filter",
 ]

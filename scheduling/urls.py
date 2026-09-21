@@ -1,4 +1,4 @@
-"""URLconf for the calendar and time configuration API (mounted under ``/api/``)."""
+"""URLconf for the calendar, scheduling and persistence APIs (mounted under ``/api/``)."""
 
 from django.urls import path
 from rest_framework.routers import SimpleRouter
@@ -6,9 +6,13 @@ from rest_framework.routers import SimpleRouter
 from scheduling.views import (
     BreakPeriodViewSet,
     CalendarExceptionViewSet,
+    CollegeScheduleDraftView,
     CollegeScheduleGenerationView,
+    DepartmentScheduleDraftView,
     DepartmentScheduleGenerationView,
     PreSchedulingValidationView,
+    ScheduleVersionViewSet,
+    ScheduleViewSet,
     TimeSlotViewSet,
     WorkingDayViewSet,
 )
@@ -21,6 +25,11 @@ router.register("time-slots", TimeSlotViewSet, basename="time-slot")
 router.register("break-periods", BreakPeriodViewSet, basename="break-period")
 router.register(
     "calendar-exceptions", CalendarExceptionViewSet, basename="calendar-exception"
+)
+# Phase 11: persisted schedules and their immutable versions. Both are read-only.
+router.register("schedules", ScheduleViewSet, basename="schedule")
+router.register(
+    "schedule-versions", ScheduleVersionViewSet, basename="schedule-version"
 )
 
 urlpatterns = [
@@ -45,6 +54,18 @@ urlpatterns = [
         "scheduling/generate-college/",
         CollegeScheduleGenerationView.as_view(),
         name="college-schedule-generation",
+    ),
+    # Phase 11: the generate-and-persist endpoints sit before the router so that
+    # "schedules/generate-department-draft/" is not read as a schedule detail id.
+    path(
+        "schedules/generate-department-draft/",
+        DepartmentScheduleDraftView.as_view(),
+        name="department-schedule-draft",
+    ),
+    path(
+        "schedules/generate-college-draft/",
+        CollegeScheduleDraftView.as_view(),
+        name="college-schedule-draft",
     ),
     *router.urls,
 ]

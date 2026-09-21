@@ -2,27 +2,37 @@
 Scheduling configuration models: the college time grid and calendar exceptions.
 
 Phase 6 defines the *available* scheduling positions (working days, teaching
-periods, breaks) and the dates that are not schedulable. Nothing here assigns a
-teaching component, instructor, room or student group to a slot — that belongs to
-future schedule entries — so those resources appear only as calendar-exception
-targets.
+periods, breaks) and the dates that are not schedulable. Phase 11 adds the
+persisted timetable: ``Schedule`` is the logical timetable of one semester and
+scope, ``ScheduleVersion`` is one immutable generated snapshot of it, and
+``ScheduleEntry`` plus its three child tables record the sessions that were placed.
 
 ``academics.Weekday`` (Sunday → Thursday) is reused; Friday and Saturday are not
 ordinary working days in this version.
 
 Delete behaviour: the time grid cascades from its working day, while references
 into academic and resource structure (``semester`` and the exception targets) use
-``PROTECT`` so structural data cannot be removed silently.
+``PROTECT`` so structural data cannot be removed silently. Persistence follows the
+same rule — version history cascades from its schedule, but a saved entry protects
+the component, room and department it refers to, because a stored version must not
+become structurally corrupt when the configuration changes.
 
 Timestamps are timezone-aware: ``USE_TZ = True`` with ``Asia/Baghdad`` as the
 application timezone (see ``config/settings.py``); no manual UTC offsets.
 """
 
+from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.validators import MinValueValidator
 from django.db import models
 
-from academics.models import Department, Semester, StudentGroup, Weekday
+from academics.models import (
+    Department,
+    Semester,
+    StudentGroup,
+    TeachingComponent,
+    Weekday,
+)
 from academics.permissions import resolve_department_id
 from resources.models import InstructorProfile, Room
 
@@ -472,3 +482,459 @@ class CalendarException(models.Model):
             f"{self.get_exception_type_display()} on {self.date} "
             f"({self.get_scope_type_display()})"
         )
+
+
+# --- Phase 11: persisted schedules and versions -----------------------------
+
+
+class ScheduleScope(models.TextChoices):
+    """Which slice of the college one logical timetable covers.
+
+    A model-level choice set rather than a serializer enum: the scope is stored on
+    the row and constrained by the database, so a payload cannot invent a third
+    scope.
+    """
+
+    DEPARTMENT = "DEPARTMENT", "Department"
+    COLLEGE = "COLLEGE", "College"
+
+
+class ScheduleStatus(models.TextChoices):
+    """Version lifecycle states.
+
+    Phase 11 only ever creates ``DRAFT``. The remaining values exist so the
+    workflow phases can add transitions without a data migration, and the field is
+    deliberately wider than today's needs.
+    """
+
+    DRAFT = "DRAFT", "Draft"
+    SUBMITTED = "SUBMITTED", "Submitted"
+    REVIEWED = "REVIEWED", "Reviewed"
+    APPROVED = "APPROVED", "Approved"
+    PUBLISHED = "PUBLISHED", "Published"
+
+
+class ScheduleVersionSource(models.TextChoices):
+    """How a version was produced.
+
+    Both values describe server-side generation. Manual copying or editing will be
+    added as its own value when it exists, so a version never has to guess its own
+    provenance.
+    """
+
+    DEPARTMENT_GENERATION = "DEPARTMENT_GENERATION", "Department generation"
+    COLLEGE_GENERATION = "COLLEGE_GENERATION", "College generation"
+
+
+class Schedule(models.Model):
+    """The logical timetable of one semester and one scope.
+
+    A department schedule belongs to exactly one department and a college schedule
+    belongs to none; both rules are enforced by a database check constraint, so a
+    half-scoped row cannot be stored. Exactly one logical schedule exists per
+    (semester, department) and one per (semester) college-wide, which is what makes
+    regenerating produce version 2 of the same schedule instead of a sibling.
+
+    Nothing is hard-deleted through the API: a schedule is the root of a version
+    history, so ``semester`` and ``department`` use ``PROTECT`` and no destroy
+    endpoint exists in Phase 11.
+    """
+
+    semester = models.ForeignKey(
+        Semester,
+        on_delete=models.PROTECT,
+        related_name="schedules",
+    )
+    scope = models.CharField(max_length=32, choices=ScheduleScope.choices)
+    department = models.ForeignKey(
+        Department,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="schedules",
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="schedules",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ("semester", "scope", "department")
+        verbose_name = "schedule"
+        verbose_name_plural = "schedules"
+        constraints = [
+            # One department schedule per semester and department.
+            models.UniqueConstraint(
+                fields=("semester", "department"),
+                condition=models.Q(scope=ScheduleScope.DEPARTMENT),
+                name="sched_uniq_dept_scope",
+            ),
+            # One college schedule per semester.
+            models.UniqueConstraint(
+                fields=("semester",),
+                condition=models.Q(scope=ScheduleScope.COLLEGE),
+                name="sched_uniq_college_scope",
+            ),
+            # DEPARTMENT needs a department, COLLEGE forbids one.
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        scope=ScheduleScope.DEPARTMENT, department__isnull=False
+                    )
+                    | models.Q(
+                        scope=ScheduleScope.COLLEGE, department__isnull=True
+                    )
+                ),
+                name="sched_scope_dept_consistency",
+            ),
+        ]
+
+    def clean(self):
+        """Keep scope and department consistent before the database sees it."""
+        errors = {}
+        if self.scope == ScheduleScope.DEPARTMENT and self.department_id is None:
+            errors["department"] = "A department schedule must name its department."
+        if self.scope == ScheduleScope.COLLEGE and self.department_id is not None:
+            errors["department"] = "A college schedule must not name a department."
+        if errors:
+            raise ValidationError(errors)
+
+    @property
+    def is_college_scope(self) -> bool:
+        """True for the single college-wide schedule of the semester."""
+        return self.scope == ScheduleScope.COLLEGE
+
+    def __str__(self) -> str:
+        target = self.department.code if self.department_id else "college"
+        return f"{self.semester} - {self.get_scope_display()} ({target})"
+
+
+class ScheduleVersion(models.Model):
+    """One immutable snapshot of a schedule.
+
+    Versions are created only by the persistence service, only as ``DRAFT``, and
+    only with a number one above the previous latest. The row is never updated
+    afterwards: a new generation writes a new version and points ``parent_version``
+    at its predecessor, so history is append-only.
+
+    Solver statistics and the validation/generation summaries are stored as plain
+    JSON, never as OR-Tools or Django objects.
+    """
+
+    schedule = models.ForeignKey(
+        Schedule,
+        on_delete=models.CASCADE,
+        related_name="versions",
+    )
+    version_number = models.PositiveIntegerField(
+        validators=[MinValueValidator(1)],
+        help_text="1 for the first persisted generation, then 2, 3, ...",
+    )
+    status = models.CharField(
+        max_length=32,
+        choices=ScheduleStatus.choices,
+        default=ScheduleStatus.DRAFT,
+    )
+    source = models.CharField(
+        max_length=40,
+        choices=ScheduleVersionSource.choices,
+    )
+    parent_version = models.ForeignKey(
+        "self",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="child_versions",
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="schedule_versions",
+    )
+    notes = models.TextField(blank=True, default="")
+
+    # Solver provenance of the generation that produced this version.
+    solver_status = models.CharField(max_length=32, blank=True, default="")
+    objective_value = models.IntegerField(null=True, blank=True)
+    solver_wall_time_seconds = models.FloatField(null=True, blank=True)
+    solver_num_conflicts = models.IntegerField(null=True, blank=True)
+    solver_num_branches = models.IntegerField(null=True, blank=True)
+
+    validation_summary = models.JSONField(default=dict, blank=True)
+    generation_summary = models.JSONField(default=dict, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("schedule", "-version_number")
+        verbose_name = "schedule version"
+        verbose_name_plural = "schedule versions"
+        constraints = [
+            models.UniqueConstraint(
+                fields=("schedule", "version_number"),
+                name="schedver_uniq_number",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(version_number__gte=1),
+                name="schedver_number_min_one",
+            ),
+        ]
+
+    def clean(self):
+        """Reject a parent that belongs to another schedule.
+
+        The service always links to the same schedule's previous version; this check
+        keeps the invariant true for admin edits and future callers too.
+        """
+        if (
+            self.parent_version_id is not None
+            and self.schedule_id is not None
+            and self.parent_version.schedule_id != self.schedule_id
+        ):
+            raise ValidationError(
+                {"parent_version": "The parent version belongs to another schedule."}
+            )
+
+    def __str__(self) -> str:
+        return f"{self.schedule} - v{self.version_number} ({self.status})"
+
+
+class ScheduleEntry(models.Model):
+    """One persisted weekly session placement inside a version.
+
+    Live foreign keys keep the academic structure reachable - the component it was
+    generated for, the managing department, the room and (through the child tables)
+    the periods, instructors and student groups - while the ``*_snapshot`` fields
+    preserve what the timetable looked like when it was generated. Recipes, room
+    names and department labels are editable, so rendering an old version must not
+    depend on today's values.
+
+    ``session_id`` and ``candidate_id`` are stored unchanged from the generation
+    result, which is what makes a persisted row traceable back to a deterministic
+    candidate.
+    """
+
+    schedule_version = models.ForeignKey(
+        ScheduleVersion,
+        on_delete=models.CASCADE,
+        related_name="entries",
+    )
+    session_id = models.CharField(max_length=200)
+    candidate_id = models.CharField(max_length=300)
+
+    teaching_component = models.ForeignKey(
+        TeachingComponent,
+        on_delete=models.PROTECT,
+        related_name="schedule_entries",
+    )
+    managing_department = models.ForeignKey(
+        Department,
+        on_delete=models.PROTECT,
+        related_name="schedule_entries",
+    )
+    session_ordinal = models.PositiveIntegerField(
+        validators=[MinValueValidator(1)],
+        help_text="1-based index of this session inside its teaching component.",
+    )
+
+    day_of_week = models.PositiveSmallIntegerField(choices=Weekday.choices)
+    room = models.ForeignKey(
+        Room,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="schedule_entries",
+    )
+    start_time = models.TimeField()
+    end_time = models.TimeField()
+    penalty = models.IntegerField(default=0)
+
+    course_id_snapshot = models.PositiveIntegerField()
+    course_code_snapshot = models.CharField(max_length=32)
+    course_name_snapshot = models.CharField(max_length=150)
+    offering_id_snapshot = models.PositiveIntegerField()
+    offering_code_snapshot = models.CharField(max_length=64, blank=True, default="")
+    component_type_snapshot = models.CharField(max_length=32, blank=True, default="")
+    component_label_snapshot = models.CharField(max_length=150, blank=True, default="")
+    managing_department_code_snapshot = models.CharField(max_length=32)
+    managing_department_name_snapshot = models.CharField(max_length=150)
+    room_code_snapshot = models.CharField(max_length=32, blank=True, default="")
+    room_name_snapshot = models.CharField(max_length=150, blank=True, default="")
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("schedule_version", "day_of_week", "start_time", "session_id")
+        verbose_name = "schedule entry"
+        verbose_name_plural = "schedule entries"
+        indexes = [
+            models.Index(
+                fields=("schedule_version", "day_of_week"),
+                name="schedentry_version_day_idx",
+            ),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=("schedule_version", "session_id"),
+                name="schedentry_uniq_session",
+            ),
+            models.UniqueConstraint(
+                fields=("schedule_version", "teaching_component", "session_ordinal"),
+                name="schedentry_uniq_component",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(session_ordinal__gte=1),
+                name="schedentry_ordinal_min_one",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(start_time__lt=models.F("end_time")),
+                name="schedentry_time_order",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(penalty__gte=0),
+                name="schedentry_penalty_nonneg",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.session_id} ({self.day_of_week}, {self.start_time})"
+
+
+class ScheduleEntryTimeSlot(models.Model):
+    """One exact period a persisted entry occupies, with its snapshot values.
+
+    The occupied periods are stored as rows rather than ids in JSON so a historical
+    version keeps both the identity and the original time labels, and the
+    ``position`` column preserves the order the entry occupied them in.
+    """
+
+    schedule_entry = models.ForeignKey(
+        ScheduleEntry,
+        on_delete=models.CASCADE,
+        related_name="time_slots",
+    )
+    time_slot = models.ForeignKey(
+        TimeSlot,
+        on_delete=models.PROTECT,
+        related_name="schedule_entry_slots",
+    )
+    position = models.PositiveIntegerField(
+        validators=[MinValueValidator(1)],
+        help_text="1-based position of this period inside the entry.",
+    )
+    sequence_snapshot = models.IntegerField()
+    label_snapshot = models.CharField(max_length=100, blank=True, default="")
+    start_time_snapshot = models.TimeField()
+    end_time_snapshot = models.TimeField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("schedule_entry", "position")
+        verbose_name = "schedule entry time slot"
+        verbose_name_plural = "schedule entry time slots"
+        constraints = [
+            models.UniqueConstraint(
+                fields=("schedule_entry", "time_slot"),
+                name="schedslot_uniq_slot",
+            ),
+            models.UniqueConstraint(
+                fields=("schedule_entry", "position"),
+                name="schedslot_uniq_position",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(position__gte=1),
+                name="schedslot_position_min_one",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(start_time_snapshot__lt=models.F("end_time_snapshot")),
+                name="schedslot_time_order",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.schedule_entry.session_id} #{self.position}"
+
+
+class ScheduleEntryInstructor(models.Model):
+    """One instructor included in a persisted entry, with its snapshot values.
+
+    The rows are the placement's own instructor set, so a later change to the
+    component's assignments cannot rewrite an old version.
+    """
+
+    schedule_entry = models.ForeignKey(
+        ScheduleEntry,
+        on_delete=models.CASCADE,
+        related_name="instructors",
+    )
+    instructor = models.ForeignKey(
+        InstructorProfile,
+        on_delete=models.PROTECT,
+        related_name="schedule_entry_instructors",
+    )
+    assignment_role_snapshot = models.CharField(max_length=32, blank=True, default="")
+    full_name_snapshot = models.CharField(max_length=200)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("schedule_entry", "instructor")
+        verbose_name = "schedule entry instructor"
+        verbose_name_plural = "schedule entry instructors"
+        constraints = [
+            models.UniqueConstraint(
+                fields=("schedule_entry", "instructor"),
+                name="schedinst_uniq_instructor",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return self.full_name_snapshot
+
+
+class ScheduleEntryStudentGroup(models.Model):
+    """One student group included in a persisted entry, with its snapshot values.
+
+    Joint courses keep the groups of every participating department, together with
+    each group's own department snapshot, so an old version can still report who
+    attended without consulting today's component links.
+    """
+
+    schedule_entry = models.ForeignKey(
+        ScheduleEntry,
+        on_delete=models.CASCADE,
+        related_name="student_groups",
+    )
+    student_group = models.ForeignKey(
+        StudentGroup,
+        on_delete=models.PROTECT,
+        related_name="schedule_entry_groups",
+    )
+    code_snapshot = models.CharField(max_length=32)
+    name_snapshot = models.CharField(max_length=100)
+    department_id_snapshot = models.PositiveIntegerField(null=True, blank=True)
+    department_code_snapshot = models.CharField(max_length=32, blank=True, default="")
+    department_name_snapshot = models.CharField(
+        max_length=150, blank=True, default=""
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("schedule_entry", "student_group")
+        verbose_name = "schedule entry student group"
+        verbose_name_plural = "schedule entry student groups"
+        constraints = [
+            models.UniqueConstraint(
+                fields=("schedule_entry", "student_group"),
+                name="schedgroup_uniq_group",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return self.code_snapshot

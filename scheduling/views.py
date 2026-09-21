@@ -1,30 +1,45 @@
-"""Calendar and time configuration API views.
+"""Calendar, scheduling, persistence and read API views.
 
 The grid resources (working days, time slots, breaks) are college-wide: everyone
 authenticated reads them, only college administrators write them. Calendar
 exceptions are scope-aware, so they reuse the department-visibility mixin and a
-dedicated permission class.
-
-Nothing here assigns resources to slots — that arrives with schedule entries in a
-later phase.
+dedicated permission class. Schedule drafts are written only by the persistence
+service, and read through scoped, read-only viewsets.
 """
 
+from dataclasses import replace
+
+from django.db.models import Count, OuterRef, Subquery
 from drf_spectacular.utils import OpenApiResponse, extend_schema
 from rest_framework import status
+from rest_framework.decorators import action
+from rest_framework.exceptions import ValidationError as DRFValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from rest_framework.viewsets import ReadOnlyModelViewSet
 
 from academics.permissions import IsCollegeAdminOrReadOnly
 from academics.views import AcademicStructureViewSet, DepartmentVisibilityQuerysetMixin
 from resources.views import QueryParameterFilterMixin
-from scheduling.models import BreakPeriod, CalendarException, TimeSlot, WorkingDay
+from scheduling.models import (
+    BreakPeriod,
+    CalendarException,
+    Schedule,
+    ScheduleEntry,
+    ScheduleScope,
+    ScheduleVersion,
+    TimeSlot,
+    WorkingDay,
+)
 from scheduling.permissions import (
     CanManageCalendarExceptions,
+    CanReadScheduleData,
     CanRunCollegeScheduleGeneration,
     CanRunPreSchedulingValidation,
     resolve_validation_scope,
     visible_calendar_exceptions_filter,
+    visible_schedules_filter,
 )
 from scheduling.serializers import (
     BreakPeriodSerializer,
@@ -33,12 +48,22 @@ from scheduling.serializers import (
     CalendarExceptionWriteSerializer,
     CollegeGenerationRejectedSerializer,
     CollegeGenerationResponseSerializer,
+    CollegeScheduleDraftResponseSerializer,
     CollegeScheduleGenerationInputSerializer,
     DepartmentGenerationResponseSerializer,
     GenerationRejectedSerializer,
     PreSchedulingValidationInputSerializer,
     PreSchedulingValidationResponseSerializer,
+    ScheduleDetailSerializer,
+    ScheduleDraftCollegeInputSerializer,
+    ScheduleDraftDepartmentInputSerializer,
+    ScheduleDraftRejectedSerializer,
+    ScheduleDraftResponseSerializer,
+    ScheduleEntrySerializer,
     ScheduleGenerationInputSerializer,
+    ScheduleSummarySerializer,
+    ScheduleVersionDetailSerializer,
+    ScheduleVersionSummarySerializer,
     TimeSlotSerializer,
     TimeSlotWriteSerializer,
     WorkingDaySerializer,
@@ -48,6 +73,7 @@ from scheduling.services.generation import (
     CollegeScheduleGenerator,
     DepartmentScheduleGenerator,
 )
+from scheduling.services.persistence import SchedulePersistenceService
 from scheduling.services.validation import PreSchedulingValidator, ValidationScope
 
 CALENDAR_TAGS = ["calendar"]
@@ -368,3 +394,377 @@ class CollegeScheduleGenerationView(APIView):
             CollegeGenerationResponseSerializer(outcome).data,
             status=status.HTTP_200_OK,
         )
+
+
+# --- Phase 11: schedule drafts, history and entries -------------------------
+
+#: Entry filters the entries action accepts on top of its version scope.
+ENTRY_FILTER_FIELDS = (
+    "managing_department",
+    "teaching_component",
+    "room",
+    "day_of_week",
+)
+
+
+def _schedule_annotations(queryset):
+    """Add the newest-version summary fields a schedule list needs.
+
+    A subquery per field keeps a list of schedules at one query instead of walking
+    each schedule's versions, and a counter keeps ``version_count`` cheap.
+    """
+    latest = ScheduleVersion.objects.filter(schedule=OuterRef("pk")).order_by(
+        "-version_number"
+    )
+    return queryset.annotate(
+        version_count=Count("versions", distinct=True),
+        latest_version_number=Subquery(latest.values("version_number")[:1]),
+        latest_version_status=Subquery(latest.values("status")[:1]),
+    ).order_by("semester_id", "scope", "department_id")
+
+
+def _visible_versions(user):
+    """Versions of the schedules ``user`` may read, with their entry counts.
+
+    The scope filter runs first, so a version of an out-of-reach schedule is not
+    merely hidden at render time: it is never in the queryset.
+    """
+    return (
+        ScheduleVersion.objects.filter(
+            schedule__in=Schedule.objects.filter(visible_schedules_filter(user))
+        )
+        .select_related(
+            "schedule",
+            "schedule__semester",
+            "schedule__semester__academic_year",
+            "schedule__department",
+            "created_by",
+            "parent_version",
+        )
+        .annotate(entry_count=Count("entries"))
+        # Aggregation drops the model's default ordering, so the newest-first rule
+        # of a version history is stated here instead of being inherited silently.
+        .order_by("schedule_id", "-version_number")
+    )
+
+
+def _draft_response(
+    *,
+    request,
+    outcome,
+    semester,
+    scope,
+    department,
+    notes,
+    response_serializer_class,
+    rejected_serializer_class,
+):
+    """Persist a generation outcome and answer the draft request.
+
+    Order matters: the generation and the solve already finished before this runs,
+    so the database write is the only thing inside the transaction. A rejected or
+    incomplete result answers ``409`` with nothing written; a completed run without a
+    timetable answers ``200`` with ``generated: false``.
+    """
+    if outcome.rejected:
+        return Response(
+            rejected_serializer_class(
+                replace(outcome, scope=scope, rejected=True)
+            ).data,
+            status=status.HTTP_409_CONFLICT,
+        )
+
+    result = SchedulePersistenceService(
+        semester=semester,
+        scope=scope,
+        department=department,
+        created_by=request.user,
+        notes=notes,
+    ).persist(outcome)
+
+    if result.reason is not None:
+        rejection = replace(
+            outcome,
+            rejected=True,
+            reason=result.reason,
+            message=result.message,
+            scope=scope,
+        )
+        return Response(
+            rejected_serializer_class(rejection).data,
+            status=status.HTTP_409_CONFLICT,
+        )
+
+    payload = response_serializer_class(outcome).data
+    # The department generator deliberately leaves ``scope`` unset, because its own
+    # preview response has no such field. A draft response always names it.
+    payload["scope"] = scope
+    payload["persisted"] = result.persisted
+    if result.persisted:
+        payload["schedule"] = ScheduleSummarySerializer(
+            _schedule_annotations(
+                Schedule.objects.select_related(
+                    "semester", "semester__academic_year", "department"
+                )
+            ).get(pk=result.schedule.pk)
+        ).data
+        version = (
+            ScheduleVersion.objects.select_related("created_by")
+            .annotate(entry_count=Count("entries"))
+            .get(pk=result.version.pk)
+        )
+        payload["version"] = ScheduleVersionSummarySerializer(version).data
+    return Response(payload, status=status.HTTP_200_OK)
+
+
+@extend_schema(tags=SCHEDULING_TAGS)
+class DepartmentScheduleDraftView(APIView):
+    """Generate one department's timetable and store it as a new draft version.
+
+    The server runs the Phase 9 pipeline itself and persists its result, so a client
+    cannot supply placements and skip instructor, room, group, availability, sharing
+    and CP-SAT constraints. Authorization matches the Phase 9 preview endpoint:
+    college administrators may draft any department, department administrators and
+    schedulers their own, and department-scoped users without a department fail
+    closed.
+
+    Nothing is written unless the generation completed: a rejected or incomplete run
+    answers ``409`` and leaves zero versions behind.
+    """
+
+    permission_classes = [IsAuthenticated, CanRunPreSchedulingValidation]
+
+    @extend_schema(
+        summary="Generate and persist a department draft timetable",
+        description=(
+            "Runs the department generation pipeline for the semester, then stores "
+            "the complete result as a new ``DRAFT`` schedule version. Regenerating "
+            "the same semester and department appends version 2, then 3, to the same "
+            "logical schedule instead of creating a second one.\n\n"
+            "The body is validated strictly: a field this endpoint does not define, "
+            "including ``placements``, ``status`` or ``version_number``, is rejected "
+            "with ``400``.\n\n"
+            "``persisted`` is true only when a complete result was stored; the "
+            "preview endpoints stay preview-only and never write."
+        ),
+        request=ScheduleDraftDepartmentInputSerializer,
+        responses={
+            200: ScheduleDraftResponseSerializer,
+            400: OpenApiResponse(
+                description=(
+                    "Malformed body, unknown semester or department id, a "
+                    "department outside the caller's scope, a time limit outside "
+                    "the accepted range, or an unsupported field."
+                )
+            ),
+            401: OpenApiResponse(description="Authentication required."),
+            403: OpenApiResponse(
+                description=(
+                    "The caller's role may not generate schedules, or a "
+                    "department-scoped caller has no department."
+                )
+            ),
+            409: ScheduleDraftRejectedSerializer,
+        },
+    )
+    def post(self, request):
+        serializer = ScheduleDraftDepartmentInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        department = resolve_validation_scope(
+            request.user,
+            scope=ValidationScope.DEPARTMENT,
+            department=data["department"],
+        )
+        outcome = DepartmentScheduleGenerator(
+            semester=data["semester"],
+            department=department,
+            max_time_seconds=data["max_time_seconds"],
+        ).generate()
+        return _draft_response(
+            request=request,
+            outcome=outcome,
+            semester=data["semester"],
+            scope=ScheduleScope.DEPARTMENT,
+            department=department,
+            notes=data["notes"],
+            response_serializer_class=ScheduleDraftResponseSerializer,
+            rejected_serializer_class=ScheduleDraftRejectedSerializer,
+        )
+
+
+@extend_schema(tags=SCHEDULING_TAGS)
+class CollegeScheduleDraftView(APIView):
+    """Generate a college-wide timetable and store it as a new draft version.
+
+    Only a college administrator or superuser may call it, matching the Phase 10
+    preview endpoint. The whole semester is generated as one problem and stored as
+    the semester's single ``COLLEGE`` schedule, which therefore owns a version
+    history separate from every department schedule of the same semester.
+    """
+
+    permission_classes = [IsAuthenticated, CanRunCollegeScheduleGeneration]
+
+    @extend_schema(
+        summary="Generate and persist a college-wide draft timetable",
+        description=(
+            "Runs the college-wide generation pipeline for the semester, then "
+            "stores the complete result as a new ``DRAFT`` version of that "
+            "semester's college schedule. Regenerating appends version 2, then 3, to "
+            "the same logical schedule.\n\n"
+            "The body is validated strictly: ``department``, ``scope``, "
+            "``placements``, ``reservations``, ``status`` and ``version_number`` "
+            "are rejected with ``400``.\n\n"
+            "Departments keep their own separate schedules for the same semester."
+        ),
+        request=ScheduleDraftCollegeInputSerializer,
+        responses={
+            200: CollegeScheduleDraftResponseSerializer,
+            400: OpenApiResponse(
+                description=(
+                    "Malformed body, unknown semester id, a time limit outside the "
+                    "accepted range, or an unsupported field."
+                )
+            ),
+            401: OpenApiResponse(description="Authentication required."),
+            403: OpenApiResponse(
+                description=(
+                    "The caller is not a college administrator, so the college-wide "
+                    "draft is out of reach."
+                )
+            ),
+            409: ScheduleDraftRejectedSerializer,
+        },
+    )
+    def post(self, request):
+        serializer = ScheduleDraftCollegeInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        outcome = CollegeScheduleGenerator(
+            semester=data["semester"],
+            max_time_seconds=data["max_time_seconds"],
+        ).generate()
+        return _draft_response(
+            request=request,
+            outcome=outcome,
+            semester=data["semester"],
+            scope=ScheduleScope.COLLEGE,
+            department=None,
+            notes=data["notes"],
+            response_serializer_class=CollegeScheduleDraftResponseSerializer,
+            rejected_serializer_class=ScheduleDraftRejectedSerializer,
+        )
+
+
+@extend_schema(tags=SCHEDULING_TAGS)
+class ScheduleViewSet(QueryParameterFilterMixin, ReadOnlyModelViewSet):
+    """Read persisted schedules: list, detail and version history.
+
+    Reads only. Creating a schedule happens by generating a draft, and no schedule
+    can be deleted through the API because it is the root of a version history.
+    """
+
+    serializer_class = ScheduleSummarySerializer
+    permission_classes = [IsAuthenticated, CanReadScheduleData]
+    filter_fields = ("semester", "scope", "department")
+    #: Declared for schema generation; every response comes from ``get_queryset``.
+    queryset = Schedule.objects.all()
+
+    def get_queryset(self):
+        queryset = _schedule_annotations(
+            Schedule.objects.select_related(
+                "semester", "semester__academic_year", "department"
+            )
+        )
+        return queryset.filter(visible_schedules_filter(self.request.user))
+
+    def get_serializer_class(self):
+        if self.action == "retrieve":
+            return ScheduleDetailSerializer
+        return ScheduleSummarySerializer
+
+    def get_object(self):
+        """Attach the newest version so the detail response stays one extra query."""
+        instance = super().get_object()
+        if self.action == "retrieve":
+            instance.latest_version_obj = (
+                ScheduleVersion.objects.filter(schedule=instance)
+                .select_related("created_by")
+                .annotate(entry_count=Count("entries"))
+                .order_by("-version_number")
+                .first()
+            )
+        return instance
+
+    @extend_schema(
+        summary="List the versions of one schedule",
+        description=(
+            "Version history of one schedule, newest first. A department user only "
+            "reaches its own department's schedules and a college-wide draft stays "
+            "with college administrators."
+        ),
+        responses=ScheduleVersionSummarySerializer(many=True),
+    )
+    @action(detail=True, methods=["get"], url_path="versions")
+    def versions(self, request, pk=None):
+        schedule = self.get_object()
+        queryset = _visible_versions(request.user).filter(schedule=schedule)
+        return Response(ScheduleVersionSummarySerializer(queryset, many=True).data)
+
+
+@extend_schema(tags=SCHEDULING_TAGS)
+class ScheduleVersionViewSet(QueryParameterFilterMixin, ReadOnlyModelViewSet):
+    """Read persisted schedule versions and their entries.
+
+    Versions are immutable snapshots: no update or delete is exposed, and entries
+    are read-only rows written once by the persistence service.
+    """
+
+    serializer_class = ScheduleVersionSummarySerializer
+    permission_classes = [IsAuthenticated, CanReadScheduleData]
+    filter_fields = ("schedule", "status", "source")
+    #: Declared for schema generation; every response comes from ``get_queryset``.
+    queryset = ScheduleVersion.objects.all()
+
+    def get_queryset(self):
+        return _visible_versions(self.request.user)
+
+    def get_serializer_class(self):
+        if self.action == "entries":
+            return ScheduleEntrySerializer
+        if self.action == "retrieve":
+            return ScheduleVersionDetailSerializer
+        return ScheduleVersionSummarySerializer
+
+    @extend_schema(
+        summary="List the entries of one schedule version",
+        description=(
+            "The sessions stored in one version, rendered from the version's own "
+            "snapshot columns, so renaming a course, room, department, instructor "
+            "or group later does not change what this version shows.\n\n"
+            "Optional exact-match filters: ``managing_department``, "
+            "``teaching_component``, ``room``, ``day_of_week``. They narrow the "
+            "authorized queryset and can never widen it."
+        ),
+        responses=ScheduleEntrySerializer(many=True),
+    )
+    @action(detail=True, methods=["get"], url_path="entries")
+    def entries(self, request, pk=None):
+        version = self.get_object()
+        queryset = (
+            ScheduleEntry.objects.filter(schedule_version=version)
+            .select_related("teaching_component", "managing_department", "room")
+            .prefetch_related("time_slots", "instructors", "student_groups")
+        )
+        for field_name in ENTRY_FILTER_FIELDS:
+            raw_value = request.query_params.get(field_name)
+            if raw_value in (None, ""):
+                continue
+            try:
+                value = int(raw_value)
+            except (TypeError, ValueError) as exc:
+                raise DRFValidationError(
+                    {field_name: "Use a numeric id for this filter."}
+                ) from exc
+            queryset = queryset.filter(**{field_name: value})
+        return Response(ScheduleEntrySerializer(queryset, many=True).data)
