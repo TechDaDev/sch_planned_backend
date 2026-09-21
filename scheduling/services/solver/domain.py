@@ -98,6 +98,12 @@ class PlacementCandidate:
     ``slot_ids = (41, 42)`` as a single option. Splitting it into independent
     decisions would let the solver place one half of a session.
 
+    A candidate is one indivisible placement option. Its identity as a placement -
+    used to reject meaningless duplicate alternatives - is the day, the slots, the
+    room and the groups and instructors involved. ``penalty`` only states how
+    expensive that placement is, so two candidates differing solely in penalty are
+    the same placement and are refused.
+
     ``instructor_ids`` holds every instructor attached to the placement - primary
     and assistants alike - because the engine only has to keep each of them free.
     """
@@ -129,11 +135,14 @@ class PlacementCandidate:
 
     @property
     def placement_key(self) -> tuple:
-        """Data that makes two candidates *the same placement* for one session.
+        """Physical identity of this placement: *where* it happens, not its cost.
 
-        ``metadata`` is excluded on purpose: it describes provenance, not the
-        placement. Two candidates with the same key on the same session are exact
-        duplicates and are rejected by the validator.
+        ``penalty`` and ``metadata`` are excluded on purpose. Two candidates with
+        the same key on the same session occupy the same day, slots, room,
+        instructors and groups; the cheaper one dominates and the other carries no
+        information, so the validator refuses the pair instead of letting a
+        meaningless alternative enlarge the search. A different penalty alone
+        therefore never makes two otherwise identical placements distinct.
         """
         return (
             self.day_of_week,
@@ -141,7 +150,6 @@ class PlacementCandidate:
             self.room_id,
             self.instructor_ids,
             self.student_group_ids,
-            self.penalty,
         )
 
     @property

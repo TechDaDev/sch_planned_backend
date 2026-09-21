@@ -655,6 +655,53 @@ def test_invalid_options_are_rejected(options):
         solve(problem, options)
 
 
+def test_same_placement_with_different_penalty_is_rejected():
+    # Penalty is a preference, not part of what and where a placement happens, so
+    # the cheaper of two otherwise identical placements is the only real choice.
+    problem = SolverProblem(
+        sessions=[session("s1", "c1")],
+        candidates=[
+            PlacementCandidate(
+                candidate_id="expensive",
+                session_id="s1",
+                day_of_week=0,
+                slot_ids=(10, 11),
+                room_id=7,
+                instructor_ids=(5,),
+                student_group_ids=(3,),
+                penalty=10,
+            ),
+            PlacementCandidate(
+                candidate_id="cheap",
+                session_id="s1",
+                day_of_week=0,
+                slot_ids=(10, 11),
+                room_id=7,
+                instructor_ids=(5,),
+                student_group_ids=(3,),
+                penalty=2,
+            ),
+        ],
+    )
+    with pytest.raises(SolverInputError, match="duplicates an existing placement"):
+        solve(problem)
+
+
+def test_a_different_room_is_a_different_placement():
+    # Only the physical placement defines identity, so a different room stays a
+    # legitimate alternative rather than a duplicate.
+    problem = SolverProblem(
+        sessions=[session("s1", "c1")],
+        candidates=[
+            candidate("room-one", "s1", slots=(10,), instructors=(5,), room=1),
+            candidate("room-two", "s1", slots=(10,), instructors=(5,), room=2),
+        ],
+    )
+    result = solve(problem)
+    assert result.status is SolverStatus.OPTIMAL
+    assert result.placement_count == 1
+
+
 def test_non_problem_input_is_rejected():
     with pytest.raises(SolverInputError):
         solve({"sessions": []})  # type: ignore[arg-type]

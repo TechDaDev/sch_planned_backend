@@ -930,7 +930,11 @@ Two documented behaviours:
   instead of crashing.
 
 Exact duplicate candidates for one session are rejected rather than silently
-deduplicated, because meaningless alternatives only enlarge the search.
+deduplicated, because meaningless alternatives only enlarge the search. Placement
+identity is *where* the session happens - day, slots, room, instructors, groups -
+so two candidates differing only in `penalty` are the same placement and the pair
+is refused; a different room, slot or resource set remains a legitimate
+alternative.
 
 ### Not in Phase 8
 
