@@ -4,9 +4,10 @@ Django REST Framework backend for the College Academic Schedule Planner.
 Provides the project foundation (configuration package, domain app skeletons,
 custom user model, API/OpenAPI plumbing) that later phases build on.
 
-- Current phase: **Phase 15 — Excel/PDF export and controlled Excel import** (read-only
-  timetable and report downloads over persisted versions and the published timetable,
-  plus a validate-then-apply semester teaching plan import).
+- Current phase: **Phase 16 — audit, backup and operational controls** (an append-only
+  scheduling audit trail, read-only operational integrity verification, and SQLite-only
+  backup/verify/restore management commands). Phase 17 will do the final
+  security/performance/release hardening.
 
 ## Architecture
 
@@ -61,14 +62,18 @@ sch_planner_backend/
 │   │   ├── workflow/  # issues, validation, service, publication
 │   │   ├── analytics/ # domain, summary, workload, rooms, gaps, quality, service
 │   │   ├── exports/   # domain, tables, excel, pdf, filenames, service
-│   │   └── imports/   # domain, issues, workbook, template, validator, applier, service
+│   │   ├── imports/   # domain, issues, workbook, template, validator, applier, service
+│   │   ├── audit/     # actions, context, service (append-only audit trail)
+│   │   └── operations/# backup, manifest, integrity (local SQLite operations)
+│   ├── management/    # create/verify/restore_local_backup, verify_operational_integrity
+│   ├── middleware.py  # request-id header used by the audit trail
 │   ├── permissions.py # calendar visibility, validation scope, schedule read/edit scope
 │   ├── serializers.py # resource, validation, generation and persistence contracts
 │   ├── views.py       # time-grid viewsets, generation endpoints, schedule read APIs
 │   ├── urls.py        # /api/working-days/, /api/scheduling/generate/, /api/schedules/
 │   └── migrations/    # 0001_calendar_and_time_configuration,
-│                      # 0002_schedule_persistence,
-│                      # 0003_manual_edit_support, 0004_workflow_publication
+│                      # 0002_schedule_persistence, 0003_manual_edit_support,
+│                      # 0004_workflow_publication, 0005_audit_event
 ├── reports/           # reserved for later report artifacts (Phase 15 exports are
 │                      # generated on request in scheduling/services/exports/)
 ├── tests/             # pytest suite for the whole project
@@ -207,6 +212,7 @@ All resource APIs expose the same five operations — `GET` list, `GET` detail,
 | Import template           | `GET /api/imports/semester-plan/template/` | college or department administrator |
 | Import validate           | `POST /api/imports/semester-plan/validate/` (multipart) | college or department administrator |
 | Import apply              | `POST /api/imports/semester-plan/apply/` (multipart) | college or department administrator |
+| Audit trail               | `GET /api/audit-events/`, `/api/audit-events/{id}/` | college admin (all), department admin (own department) |
 
 Write ownership in this table is stricter than read visibility for shared
 resources: shared instructors and rooms are readable by the departments they are
@@ -2275,6 +2281,241 @@ timestamps). The data sheets carry headers only, with the examples in the `READM
 validating the untouched template reports `8` sheets, `0` rows, `0` errors and applying it
 writes nothing.
 
+## Scheduling audit trail
+
+```
+GET /api/audit-events/
+GET /api/audit-events/{id}/
+```
+
+`AuditEvent` answers one question: **who performed which successful operational action,
+and when**. It is not a second version history - `ScheduleVersion`, `parent_version`, the
+workflow timestamps and the snapshot columns remain the record of what a timetable
+contained and how it changed. An audit event never carries timetable content.
+
+### Audited actions
+
+| Action | Written by | After |
+| --- | --- | --- |
+| `DEPARTMENT_DRAFT_GENERATED` | `POST /api/schedules/generate-department-draft/` | a version was stored |
+| `COLLEGE_DRAFT_GENERATED` | `POST /api/schedules/generate-college-draft/` | a version was stored |
+| `MANUAL_EDIT_APPLIED` | `POST /api/schedule-versions/{id}/manual-edit/` | a new `MANUAL_EDIT` version was appended |
+| `SCHEDULE_SUBMITTED` / `SCHEDULE_REVIEWED` / `SCHEDULE_APPROVED` / `SCHEDULE_PUBLISHED` | the matching workflow endpoint | the stage change was stored |
+| `SEMESTER_PLAN_IMPORTED` | `POST /api/imports/semester-plan/apply/` | the plan rows were created |
+
+Deliberately **not** audited: any `GET`, the validation-only endpoints
+(`/api/scheduling/validate/`, `/validate-manual-edit/`, `/workflow-validation/`,
+`/api/imports/semester-plan/validate/`), the generation previews
+(`/api/scheduling/generate/`, `/api/scheduling/generate-college/`), analytics, and every
+`/export/xlsx|pdf/` download. Those endpoints keep producing zero audit rows and their
+no-write guarantees are unchanged.
+
+Failed and rolled-back operations leave no event either. An event is written by a semantic
+`AuditService.record(...)` call inside the same `transaction.atomic()` block as the
+mutation it describes, so a rejected generation, a refused workflow transition, an invalid
+manual edit or a refused import commits neither the change nor a "success" record. There
+are no `post_save` signals anywhere in this path: the operation that succeeded says so
+explicitly.
+
+### What an event stores
+
+```
+id (UUID)          created_at        action
+actor (SET_NULL)   actor_username_snapshot   actor_role_snapshot
+department / semester / schedule / schedule_version   (all SET_NULL)
+object_type        object_id         request_id        metadata (JSON)
+```
+
+Actor identity is snapshotted at event time, so the trail still reads correctly after an
+account is renamed, disabled or deleted; every live reference is `SET_NULL` so removing a
+user, department, semester, schedule or version never erases the record that something
+happened. `object_type`/`object_id` name the semantic target without a generic foreign key
+(`ScheduleVersion` / `14`, `SemesterPlanImport` / `department:2:semester:5`). `request_id`
+comes from the optional `X-Request-ID` request header, sanitized and length-capped, or is
+generated per request.
+
+Ordering is `-created_at, -id`: newest first, with the UUID as a deterministic tie-breaker
+for events written inside one transaction. Indexes cover `created_at`, `action`,
+`department+created_at`, `semester+created_at`, `schedule+created_at` and
+`actor+created_at`.
+
+### Metadata safety
+
+Metadata is structured operational facts only: version number, source, entry counts,
+changed entry count, `from_status`/`to_status`, solver status, import created counts,
+warning count, base version id, whether a publication became authoritative. `AuditService`
+sanitizes it on the way in: keys that mention a password, hash, token, JWT, cookie, secret,
+key, authorization header, credential or environment are dropped entirely, nested values
+are flattened, over-long strings are truncated and the key count is capped, so a caller
+cannot turn the trail into a secret store. Raw workbooks, file bytes, request bodies,
+environment variables and full headers are never written.
+
+### Reading the trail
+
+| Caller | Sees |
+| --- | --- |
+| college administrator or superuser | every event |
+| department administrator | only events attributed to its own department |
+| department administrator without a department | `403` (nothing can be scoped for it) |
+| scheduler, viewer, instructor | `403`: the trail is administrative oversight, not teaching information |
+
+A college-wide operation stores **no** department, which is what keeps
+`COLLEGE_DRAFT_GENERATED` and a college `SCHEDULE_PUBLISHED` invisible to every department
+administrator: privacy is a property of the data, not of a filter somebody has to
+remember to apply. Authorization is applied before the user's own filters, so a
+`?department=<foreign>` query narrows what a caller may already see instead of widening it,
+and a foreign event answers `404`.
+
+Filters: `action`, `department`, `semester`, `schedule`, `schedule_version`, `actor`,
+`created_after`, `created_before`. Reads are paginated, return shallow summaries
+(`actor: {id, username_snapshot, role_snapshot}`, plus the semester/schedule/version
+summaries) and expose no account detail beyond that.
+
+The endpoints are read-only: `POST`, `PUT`, `PATCH` and `DELETE` answer `405`, and
+`AuditEvent` is registered in the Django admin with add, change and delete all refused, so
+the admin is not a back door around that rule. There is no audit-log deletion anywhere in
+the project.
+
+## Local backup, restore and integrity
+
+Four management commands, all operator-only:
+
+```bash
+python manage.py create_local_backup
+python manage.py verify_local_backup <backup.zip>
+python manage.py restore_local_backup <backup.zip> --confirm RESTORE
+python manage.py verify_operational_integrity
+```
+
+None of this is reachable over HTTP: no browser or API client can back up or - far more
+important - restore the database. Backup and restore are SQLite-only, and they say so:
+`create_local_backup` and `restore_local_backup` read `connection.vendor` and refuse
+anything else with a controlled message (`LOCAL_BACKUP_UNSUPPORTED_VENDOR`), because a
+file-level copy of a PostgreSQL database is not a backup. The PostgreSQL/Railway backup
+strategy belongs to Phase 17 deployment preparation, and Phase 16 does not pretend
+otherwise. A non-file SQLite configuration (`:memory:`, `file:` URIs) is refused too
+(`LOCAL_BACKUP_UNSUPPORTED_DATABASE`).
+
+### Archive format
+
+One `.zip` containing exactly two members, no directories, no absolute paths and no
+traversal:
+
+```
+manifest.json
+database.sqlite3
+```
+
+The manifest (format version `1`) records `created_at` (UTC), project, database vendor,
+Django version, database size, database SHA-256, the applied migration list, the migration
+fingerprint, the SQLite integrity verdict and the application timezone. It deliberately
+excludes `SECRET_KEY`, database credentials, environment variables, user data and tokens.
+
+Backup filenames are UTC and content-addressed, for example
+`sch_planner_20260921T194500Z_scheduler_08974b13ea.zip`; the automatic pre-restore backup
+adds a `pre-restore` label. Application timestamps remain Asia/Baghdad; only backup
+artifacts use UTC.
+
+### Creating a backup
+
+1. resolve the SQLite source and refuse a non-file or non-SQLite database;
+2. create a temporary destination and copy the database with **Python's SQLite online
+   backup API** - never `shutil.copy` of a live file, which can capture a torn database;
+3. run `PRAGMA integrity_check` on the copy and require `ok`;
+4. compute the SHA-256, read the applied migrations from the copy and build the manifest;
+5. write the archive in a temporary directory and move it into place with `os.replace`.
+
+A failure before the final move leaves no file that looks like a finished backup.
+
+The directory defaults to `<project>/var/backups`
+(`DJANGO_LOCAL_BACKUP_DIR`), is created on demand with mode `0700`, the archive is written
+mode `0600`, and `var/` is git-ignored so a backup is never committed. A platform without
+POSIX modes skips the chmod; a real filesystem failure is reported rather than hidden.
+
+### Verifying a backup
+
+`verify_local_backup` re-checks the archive independently of how it was created: archive
+readability, exactly the expected members, safe member names (no absolute paths, no `..`,
+no duplicates, no executables, no extra database files), manifest presence and shape,
+format version, vendor support, recorded integrity verdict, database size, SHA-256, SQLite
+`integrity_check`, and - by default - that the migration fingerprint matches this
+installation. Every check is reported individually, and the command exits non-zero unless
+all of them pass. Nothing is extracted to a permanent location.
+
+A single flipped byte in the database member therefore fails verification through the
+checksum or through the SQLite verdict, and a member that is not a SQLite database at all
+is reported as `BACKUP_DATABASE_UNREADABLE` instead of crashing the command.
+
+### Restoring a backup
+
+Restore is conservative and hard to run by accident:
+
+1. verify the archive completely;
+2. compare the migration fingerprint with the current one and **refuse** a mismatch
+   (`BACKUP_SCHEMA_MISMATCH`). There is no `--force-schema-mismatch` flag in Phase 16;
+3. create a safety backup of the current database automatically. If that fails, nothing is
+   restored, and there is no flag that skips it;
+4. extract the database to a controlled temporary file and integrity-check it;
+5. close the affected Django connection, then replace the target with `os.replace` - an
+   atomic filesystem move, never a byte copy over a live file;
+6. verify the restored file (integrity plus fingerprint) and, if that unexpectedly fails,
+   put the safety backup back and report the rollback rather than leaving a corrupt
+   database active.
+
+`restore_local_backup` requires `--confirm RESTORE`; without it the command refuses with
+`LOCAL_RESTORE_CONFIRMATION_REQUIRED`. `--dry-run` verifies everything and replaces
+nothing. `--target` exists for tests and for restoring into a copy, which is how the
+commands were verified without touching the development database.
+
+### Operational integrity
+
+```bash
+python manage.py verify_operational_integrity [--json]
+```
+
+Read-only structural verification of the application's own invariants - not a timetable
+feasibility check, which stays with the Phase 13 `WorkflowVersionValidator`:
+
+| Check | Codes |
+| --- | --- |
+| database connectivity, no unapplied migrations, consistent migration graph | `DATABASE_CONNECTIVITY_FAILED`, `UNAPPLIED_MIGRATIONS`, `MIGRATION_GRAPH_INCONSISTENT` |
+| every `Schedule.published_version` belongs to that schedule, is `PUBLISHED`, and the schedule is college-scoped | `INVALID_PUBLISHED_POINTER` |
+| version numbers start at 1, are unique and strictly contiguous; each version's parent is the previous one | `VERSION_NUMBER_SEQUENCE_INVALID`, `VERSION_PARENT_LINEAGE_INVALID` |
+| every entry has at least one period, instructor and student group; spans are ordered; period positions start at 1 and are contiguous | `ENTRY_WITHOUT_TIME_SLOTS`, `ENTRY_WITHOUT_INSTRUCTORS`, `ENTRY_WITHOUT_STUDENT_GROUPS`, `ENTRY_TIME_RANGE_INVALID`, `ENTRY_SLOT_POSITION_INVALID` |
+| no duplicate `session_id` or `(component, session_ordinal)` inside a version, which would mean the database was modified outside the ORM | `DUPLICATE_SESSION_ID`, `DUPLICATE_SESSION_ORDINAL` |
+
+Multiple historical `PUBLISHED` versions are allowed: only the pointer has to agree with
+the version it names. A healthy database exits `0`; any issue exits non-zero through
+`CommandError`, so a monitoring rule cannot mistake printed problems for success. The
+command never repairs, republishes, reparents or deletes anything - Phase 16 detects
+corruption, it does not silently fix it.
+
+`--json` prints the same report as a machine-readable object:
+
+```json
+{
+  "ok": false,
+  "checks": { "database_connectivity": true, "applied_migrations": 30 },
+  "issues": [
+    {
+      "code": "INVALID_PUBLISHED_POINTER",
+      "object": "Schedule",
+      "object_id": 5,
+      "message": "version 3 has status DRAFT, not PUBLISHED."
+    }
+  ]
+}
+```
+
+### What the commands never print
+
+`SECRET_KEY`, database credentials, password hashes, tokens or the environment. Archive
+paths, sizes, checksums and fingerprints are safe to print and are printed.
+
+Backup archives are self-describing, so a restore does not depend on the audit trail, and
+no `AuditEvent` is written by a restore: replacing the database would give that record
+ambiguous semantics.
+
 ## Who may write what
 
 | Role | Reads | Writes |
@@ -2316,6 +2557,12 @@ structure - `SCHEDULER` is refused here even though it may submit and edit draft
 they reuse the read scoping of the version (Phase 11-14) or of the published timetable, so a
 file can never show more than the API already would.
 
+Phase 16 adds the audit trail, which is administrative oversight: `COLLEGE_ADMIN` reads
+everything, `DEPARTMENT_ADMIN` reads only its own department's events, `SCHEDULER`,
+`VIEWER` and `INSTRUCTOR` are refused (`CanReadAuditEvents`), and a department-scoped
+account without a department is refused rather than shown an empty trail. The backup and
+integrity management commands are operator tools with no HTTP surface at all.
+
 ## Timezone
 
 Django runs timezone-aware (`USE_TZ = True`) with `TIME_ZONE = "Asia/Baghdad"`.
@@ -2338,6 +2585,7 @@ Settings are read from environment variables (optionally via `.env`):
 | `DJANGO_SEMESTER_PLAN_IMPORT_MAX_SHEET_ROWS` | `2000`                            |
 | `DJANGO_SEMESTER_PLAN_IMPORT_MAX_TOTAL_ROWS` | `10000`                           |
 | `DJANGO_SEMESTER_PLAN_IMPORT_MAX_SCANNED_ROWS` | `20000`                         |
+| `DJANGO_LOCAL_BACKUP_DIR` | `<project>/var/backups` (git-ignored, created `0700`) |
 
 Other fixed settings: `AUTH_USER_MODEL = "accounts.User"`,
 `TIME_ZONE = "Asia/Baghdad"`, `USE_I18N = True`, `USE_TZ = True`, SQLite via
@@ -2389,7 +2637,12 @@ not used.
 - **Phase 15 (done)** — Excel/PDF export and controlled Excel import: read-only timetable
   and report downloads over persisted versions and the published timetable, a generated
   import template, and a validate-then-apply semester teaching plan import.
-- **Phase 16 (planned)** — the next phase; its scope is not fixed in this repository yet.
+- **Phase 16 (done)** — audit, backup and operational controls: an append-only audit
+trail over successful scheduling mutations, a read-only operational integrity command,
+and SQLite-only local backup/verify/restore tooling.
+- **Phase 17 (planned)** — final security, performance and release hardening, and
+deployment preparation (including the PostgreSQL/Railway backup strategy that Phase 16
+deliberately leaves out).
 - **Later** — reservations and department regeneration from an authoritative version,
   PostgreSQL, background jobs, Railway deployment.
 - **Flutter instructor app** — after the web application, using

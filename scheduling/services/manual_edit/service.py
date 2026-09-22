@@ -22,6 +22,7 @@ from typing import Iterable
 
 from django.db import IntegrityError, transaction
 from scheduling.models import Schedule, ScheduleStatus, ScheduleVersion
+from scheduling.services.audit import record_manual_edit
 from scheduling.services.manual_edit.cloning import clone_version
 from scheduling.services.manual_edit.domain import (
     ManualEditChange,
@@ -161,6 +162,15 @@ class ManualEditService:
                     proposal=revalidated.proposal,
                     created_by=self.created_by,
                     notes=self.notes,
+                )
+                # Inside the same transaction as the new version, so a rolled-back edit
+                # leaves no event and a stored edit cannot go unaudited.
+                record_manual_edit(
+                    actor=self.created_by,
+                    version=version,
+                    base_version_id=self.version.pk,
+                    entry_count=revalidated.proposal.entry_count,
+                    changed_entries=revalidated.proposal.changed_entry_count,
                 )
         except IntegrityError:
             # The rollback removed the whole version, so the caller can simply retry;

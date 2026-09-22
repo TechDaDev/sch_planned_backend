@@ -36,6 +36,7 @@ from scheduling.models import (
     ScheduleStatus,
     ScheduleVersion,
 )
+from scheduling.services.audit import record_workflow_transition
 from scheduling.services.workflow.issues import (
     REASON_SCHEDULE_VALIDATION_FAILED,
     WorkflowIssueCode,
@@ -219,6 +220,15 @@ class ScheduleWorkflowService:
                 locked_schedule.save(
                     update_fields=["published_version", "updated_at"]
                 )
+            # One event per successful transition, inside the same transaction as the
+            # status change: a refused or rolled-back transition records nothing.
+            record_workflow_transition(
+                actor=self.user,
+                version=locked_version,
+                from_status=from_status,
+                to_status=locked_version.status,
+                became_authoritative=self.action == ACTION_PUBLISH,
+            )
 
         return WorkflowResult(
             applied=True,

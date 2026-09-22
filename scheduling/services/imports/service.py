@@ -18,6 +18,7 @@ from typing import Any
 
 from django.db import transaction
 
+from scheduling.services.audit import record_semester_plan_import
 from scheduling.services.imports.applier import write_plan
 from scheduling.services.imports.domain import DATA_SHEETS, PlanWorkbook
 from scheduling.services.imports.issues import IssueCollector
@@ -212,6 +213,15 @@ class SemesterPlanImportService:
             if not validation.valid:
                 return SemesterPlanApplication(validation=validation, created={})
             created = write_plan(validation.plan)
+            # Inside the same transaction as the created rows: a refused import records
+            # nothing, and an applied import cannot go unaudited.
+            record_semester_plan_import(
+                actor=self.user,
+                department=self.department,
+                semester=self.semester,
+                created=created,
+                warning_count=validation.collector.warning_count,
+            )
         return SemesterPlanApplication(validation=validation, created=created)
 
 

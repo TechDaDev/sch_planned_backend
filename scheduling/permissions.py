@@ -51,6 +51,11 @@ it is a narrower role set than reading a draft: ``COLLEGE_ADMIN`` may import for
 department and ``DEPARTMENT_ADMIN`` only for its own. ``SCHEDULER`` is refused because it
 has no catalog-write authority anywhere in the API, and ``VIEWER``/``INSTRUCTOR`` are
 refused as before. Exports stay read-only and reuse the Phase 14 access rules.
+
+Phase 16 adds the audit trail. Reading it is administrative oversight, so ``SCHEDULER``,
+``VIEWER`` and ``INSTRUCTOR`` are refused. A department administrator sees the events
+actioned in its own department and nothing else: college-wide operations store no
+department, which is what keeps them out of a department's view.
 """
 
 from django.db import models
@@ -279,6 +284,55 @@ class CanReadPublishedAnalytics(BasePermission):
         return can_read_published_analytics(request.user)
 
 
+#: Roles that may read the audit trail.
+#: ``SCHEDULER``, ``VIEWER`` and ``INSTRUCTOR`` are deliberately absent: the trail is
+#: administrative oversight, not teaching information.
+AUDIT_READ_ROLES = frozenset({UserRole.COLLEGE_ADMIN, UserRole.DEPARTMENT_ADMIN})
+
+
+def can_read_audit_events(user) -> bool:
+    """True when the user's role may read the audit trail at all."""
+    return bool(user.is_superuser or user.role in AUDIT_READ_ROLES)
+
+
+def visible_audit_events_filter(user) -> models.Q:
+    """Which audit events a user may read.
+
+    A college administrator reads everything. A department administrator reads the events
+    attributed to its own department and nothing else: a college-wide operation stores no
+    department at all, so it stays invisible to every department. A department-scoped
+    account without a department fails closed with an empty queryset.
+    """
+    if user.has_cross_department_access:
+        return models.Q()
+    if user.department_id is None or not can_read_audit_events(user):
+        return models.Q(pk__in=[])
+    return models.Q(department_id=user.department_id)
+
+
+class CanReadAuditEvents(BasePermission):
+    """Role gate for the audit read API.
+
+    The role decides whether the trail is reachable at all; which events come back is
+    decided by :func:`visible_audit_events_filter`, so a foreign event answers ``404``
+    rather than advertising that it exists.
+
+    A department-scoped account without a department is refused outright: nothing can be
+    scoped for it, and an empty trail would look like "nothing happened" rather than "you
+    have no scope".
+    """
+
+    def has_permission(self, request, view) -> bool:
+        if not is_authenticated_active_user(request):
+            return False
+        user = request.user
+        if not can_read_audit_events(user):
+            return False
+        if not user.has_cross_department_access and user.department_id is None:
+            return False
+        return True
+
+
 #: Roles that may import a semester teaching plan.
 #: ``SCHEDULER`` is deliberately absent: it holds no catalog-write authority anywhere in
 #: the API, and importing creates courses, groups, offerings and components.
@@ -409,6 +463,7 @@ def resolve_validation_scope(user, *, scope, department):
 
 
 __all__ = [
+    "AUDIT_READ_ROLES",
     "PUBLISHED_ANALYTICS_ROLES",
     "SCHEDULE_EDIT_ROLES",
     "SCHEDULE_READ_ROLES",
@@ -417,6 +472,7 @@ __all__ = [
     "CanEditScheduleDraft",
     "CanImportSemesterPlan",
     "CanManageCalendarExceptions",
+    "CanReadAuditEvents",
     "CanReadPublishedAnalytics",
     "CanReadScheduleData",
     "CanRunCollegeScheduleGeneration",
@@ -424,11 +480,13 @@ __all__ = [
     "CanRunScheduleWorkflow",
     "can_edit_schedule_data",
     "can_import_semester_plan",
+    "can_read_audit_events",
     "can_read_published_analytics",
     "can_read_schedule_data",
     "can_run_schedule_workflow",
     "resolve_import_department",
     "resolve_validation_scope",
+    "visible_audit_events_filter",
     "visible_calendar_exceptions_filter",
     "visible_schedules_filter",
 ]

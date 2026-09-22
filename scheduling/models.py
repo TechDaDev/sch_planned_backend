@@ -24,10 +24,13 @@ Timestamps are timezone-aware: ``USE_TZ = True`` with ``Asia/Baghdad`` as the
 application timezone (see ``config/settings.py``); no manual UTC offsets.
 """
 
+import uuid
+
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.validators import MinValueValidator
 from django.db import models
+from django.utils import timezone
 
 from academics.models import (
     Department,
@@ -1006,3 +1009,118 @@ class ScheduleEntryStudentGroup(models.Model):
 
     def __str__(self) -> str:
         return self.code_snapshot
+
+
+# --- Phase 16: audit trail ---------------------------------------------------
+
+
+class AuditAction(models.TextChoices):
+    """The operations Phase 16 records.
+
+    One value per business operation that is security- or operations-significant, and
+    only for operations that actually succeeded. Reads, validation-only calls, previews
+    and downloads are deliberately absent: an audit trail of everything that was looked
+    at is surveillance, not accountability.
+    """
+
+    DEPARTMENT_DRAFT_GENERATED = (
+        "DEPARTMENT_DRAFT_GENERATED",
+        "Department draft generated",
+    )
+    COLLEGE_DRAFT_GENERATED = "COLLEGE_DRAFT_GENERATED", "College draft generated"
+    MANUAL_EDIT_APPLIED = "MANUAL_EDIT_APPLIED", "Manual edit applied"
+    SCHEDULE_SUBMITTED = "SCHEDULE_SUBMITTED", "Schedule version submitted"
+    SCHEDULE_REVIEWED = "SCHEDULE_REVIEWED", "Schedule version reviewed"
+    SCHEDULE_APPROVED = "SCHEDULE_APPROVED", "Schedule version approved"
+    SCHEDULE_PUBLISHED = "SCHEDULE_PUBLISHED", "Schedule version published"
+    SEMESTER_PLAN_IMPORTED = "SEMESTER_PLAN_IMPORTED", "Semester teaching plan imported"
+
+
+class AuditEvent(models.Model):
+    """One successful, security- or operations-significant scheduling operation.
+
+    The trail is append-only by construction: nothing in the application updates or
+    deletes a row, the admin refuses add/change/delete, and every reference to live data
+    uses ``SET_NULL`` so removing a user, department, semester, schedule or version never
+    erases the record that something happened. Actor identity is therefore also stored as
+    a snapshot: history must read the same after the account changes.
+
+    An event is written inside the transaction of the operation it describes, so a
+    rolled-back mutation leaves no "success" behind.
+
+    Ordering is ``-created_at, -id``: newest first, with the UUID as a deterministic
+    tie-breaker for events written inside the same transaction.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    action = models.CharField(
+        max_length=64,
+        choices=AuditAction.choices,
+        db_index=True,
+    )
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="audit_events",
+        help_text="Who performed the operation; null after the account is removed.",
+    )
+    actor_username_snapshot = models.CharField(max_length=150, blank=True, default="")
+    actor_role_snapshot = models.CharField(max_length=32, blank=True, default="")
+    department = models.ForeignKey(
+        Department,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="audit_events",
+        help_text=(
+            "Owning department of the operation, when it has one. Null marks a "
+            "college-wide operation, which only college administrators may read."
+        ),
+    )
+    semester = models.ForeignKey(
+        Semester,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="audit_events",
+    )
+    schedule = models.ForeignKey(
+        Schedule,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="audit_events",
+    )
+    schedule_version = models.ForeignKey(
+        ScheduleVersion,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="audit_events",
+    )
+    object_type = models.CharField(max_length=64, blank=True, default="")
+    object_id = models.CharField(max_length=128, blank=True, default="")
+    request_id = models.CharField(max_length=64, blank=True, default="", db_index=True)
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        ordering = ("-created_at", "-id")
+        verbose_name = "audit event"
+        verbose_name_plural = "audit events"
+        indexes = [
+            models.Index(fields=("department", "created_at")),
+            models.Index(fields=("semester", "created_at")),
+            models.Index(fields=("schedule", "created_at")),
+            models.Index(fields=("actor", "created_at")),
+        ]
+
+    @property
+    def is_college_wide(self) -> bool:
+        """True when the event belongs to no department, so only college admins read it."""
+        return self.department_id is None
+
+    def __str__(self) -> str:
+        return f"{self.action} at {timezone.localtime(self.created_at):%Y-%m-%d %H:%M}"

@@ -23,6 +23,10 @@ db.sqlite3-journal
 staticfiles/
 media/
 
+# Local SQLite backups (Phase 16) and their temporary working files
+var/
+*.sqlite3.tmp
+
 # Environment variables
 .env
 .env.*

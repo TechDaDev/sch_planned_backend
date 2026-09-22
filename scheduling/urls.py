@@ -4,6 +4,7 @@ from django.urls import path
 from rest_framework.routers import SimpleRouter
 
 from scheduling.views import (
+    AuditEventViewSet,
     BreakPeriodViewSet,
     CalendarExceptionViewSet,
     CollegeScheduleDraftView,
@@ -38,6 +39,8 @@ router.register("schedules", ScheduleViewSet, basename="schedule")
 router.register(
     "schedule-versions", ScheduleVersionViewSet, basename="schedule-version"
 )
+# Phase 16: the audit trail, read-only like every other operational record.
+router.register("audit-events", AuditEventViewSet, basename="audit-event")
 
 urlpatterns = [
     # Phase 7: a computed, read-only report rather than a resource collection, so

@@ -78,6 +78,7 @@ MIDDLEWARE = [
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "scheduling.middleware.AuditRequestIdMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
@@ -199,6 +200,12 @@ SEMESTER_PLAN_IMPORT_MAX_SCANNED_ROWS = int(
     os.environ.get("DJANGO_SEMESTER_PLAN_IMPORT_MAX_SCANNED_ROWS", 20000)
 )
 
+# Where ``manage.py create_local_backup`` writes archives. Local development default;
+# the directory is created on demand with owner-only permissions and is git-ignored.
+LOCAL_BACKUP_DIR = Path(
+    os.environ.get("DJANGO_LOCAL_BACKUP_DIR", str(BASE_DIR / "var" / "backups"))
+)
+
 
 # SimpleJWT. Token issuing endpoints are added in a later phase.
 
@@ -267,6 +274,14 @@ SPECTACULAR_SETTINGS = {
                 "Pre-scheduling validation, generation previews and persisted "
                 "schedule drafts: readiness checks, department and college-wide "
                 "generation, and the read APIs for schedules, versions and entries."
+            ),
+        },
+        {
+            "name": "operations",
+            "description": (
+                "Operational records: the read-only scheduling audit trail. Local "
+                "backup and integrity verification are management commands, not HTTP "
+                "endpoints."
             ),
         },
     ],

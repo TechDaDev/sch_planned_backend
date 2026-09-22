@@ -26,6 +26,7 @@ from django.utils import timezone
 
 from academics.models import StudentGroup
 from scheduling.models import (
+    AuditEvent,
     Schedule,
     ScheduleEntry,
     ScheduleEntryInstructor,
@@ -36,6 +37,10 @@ from scheduling.models import (
     ScheduleVersion,
     ScheduleVersionSource,
     TimeSlot,
+)
+from scheduling.services.audit import (
+    record_college_draft,
+    record_department_draft,
 )
 from scheduling.services.persistence.snapshots import (
     EntrySnapshot,
@@ -129,6 +134,9 @@ class SchedulePersistenceService:
                 version = self._create_version(schedule, outcome)
                 self._write_entries(version, snapshots)
                 self._touch(schedule)
+                self._record_audit(
+                    schedule=schedule, version=version, entry_count=len(snapshots)
+                )
         except IntegrityError:
             # The rollback removed the whole version, so a concurrent request can
             # simply try again; the caller sees a controlled rejection, never a 500.
@@ -225,6 +233,45 @@ class SchedulePersistenceService:
         )
 
     # --- writes ------------------------------------------------------------
+
+    def _record_audit(
+        self, *, schedule: Schedule, version: ScheduleVersion, entry_count: int
+    ) -> AuditEvent:
+        """Write the draft-generation audit event inside the version's transaction.
+
+        A department draft is attributed to its own department, so that department's
+        administrators can read it. A college draft records no department: it covers the
+        whole college, and attributing it to one department would leak a college-level
+        operation into that department's audit view. A failure here fails the whole
+        persistence, which is the point - a stored timetable must not go unaudited.
+        """
+        base_version_id = version.parent_version_id
+        common = {
+            "actor": self.created_by,
+            "semester": self.semester,
+            "schedule": schedule,
+            "schedule_version": version,
+            "entry_count": entry_count,
+            "source": self.source,
+            "solver_status": version.solver_status,
+            "solver_wall_time_seconds": version.solver_wall_time_seconds,
+            "base_version_id": base_version_id,
+        }
+        if self.scope == ScheduleScope.COLLEGE:
+            return record_college_draft(
+                department_count=self._department_count(version), **common
+            )
+        return record_department_draft(department=schedule.department, **common)
+
+    @staticmethod
+    def _department_count(version: ScheduleVersion) -> int:
+        """How many managing departments the stored version covers."""
+        return (
+            version.entries.order_by()
+            .values("managing_department_id")
+            .distinct()
+            .count()
+        )
 
     def _locked_schedule(self) -> Schedule:
         """The logical schedule of this semester and scope, locked for allocation.

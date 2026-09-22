@@ -34,6 +34,7 @@ from resources.serializers import (
     RoomSummarySerializer,
 )
 from scheduling.models import (
+    AuditEvent,
     BreakPeriod,
     CalendarException,
     ExceptionScope,
@@ -1725,3 +1726,83 @@ class SemesterPlanImportRequestSerializer(serializers.Serializer):
     )
     semester = serializers.IntegerField(help_text="Semester the plan belongs to.")
     file = serializers.FileField(help_text="The .xlsx workbook to read.")
+
+
+# --- Phase 16: audit trail ---------------------------------------------------
+
+
+class AuditActorSerializer(serializers.Serializer):
+    """Who performed an audited operation.
+
+    The snapshot fields are authoritative: ``id`` is null once the account is removed,
+    while the username and role recorded at the time of the operation remain readable.
+    No other user field is exposed, and nothing here can be written.
+    """
+
+    id = serializers.IntegerField(allow_null=True, required=False)
+    username_snapshot = serializers.CharField(allow_blank=True)
+    role_snapshot = serializers.CharField(allow_blank=True)
+
+
+class AuditScheduleRefSerializer(serializers.Serializer):
+    """Shallow identity of the schedule an event belongs to."""
+
+    id = serializers.IntegerField()
+    scope = serializers.ChoiceField(choices=ScheduleScope.choices)
+    semester_id = serializers.IntegerField()
+    department_id = serializers.IntegerField(allow_null=True, required=False)
+
+
+class AuditVersionRefSerializer(serializers.Serializer):
+    """Shallow identity of the schedule version an event belongs to."""
+
+    id = serializers.IntegerField()
+    version_number = serializers.IntegerField()
+    status = serializers.ChoiceField(choices=ScheduleStatus.choices)
+    source = serializers.ChoiceField(choices=ScheduleVersionSource.choices)
+
+
+class AuditEventSerializer(serializers.ModelSerializer):
+    """One audit event as the read API returns it.
+
+    Related objects are shallow summaries, because the trail describes what happened, not
+    the current state of the records involved. ``metadata`` is structured operational
+    data only; secrets and payloads are removed before the row is written.
+    """
+
+    actor = serializers.SerializerMethodField()
+    department = DepartmentSummarySerializer(read_only=True)
+    semester = SemesterSummarySerializer(read_only=True)
+    schedule = AuditScheduleRefSerializer(read_only=True)
+    schedule_version = AuditVersionRefSerializer(read_only=True)
+
+    @extend_schema_field(AuditActorSerializer)
+    def get_actor(self, obj) -> dict[str, Any]:
+        """The actor as the snapshot fields describe it.
+
+        The snapshot is used instead of the live user, so an event still reads correctly
+        after the account is renamed, deactivated or deleted.
+        """
+        return {
+            "id": obj.actor_id,
+            "username_snapshot": obj.actor_username_snapshot,
+            "role_snapshot": obj.actor_role_snapshot,
+        }
+
+    class Meta:
+        model = AuditEvent
+        fields = (
+            "id",
+            "created_at",
+            "action",
+            "actor",
+            "department",
+            "semester",
+            "schedule",
+            "schedule_version",
+            "object_type",
+            "object_id",
+            "request_id",
+            "metadata",
+        )
+        read_only_fields = fields

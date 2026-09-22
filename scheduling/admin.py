@@ -9,6 +9,7 @@ generation or persistence logic of their own.
 from django.contrib import admin
 
 from scheduling.models import (
+    AuditEvent,
     BreakPeriod,
     CalendarException,
     Schedule,
@@ -225,3 +226,57 @@ class ScheduleEntryInstructorAdmin(admin.ModelAdmin):
 class ScheduleEntryStudentGroupAdmin(admin.ModelAdmin):
     list_display = ("id", "schedule_entry", "student_group", "code_snapshot")
     list_select_related = ("schedule_entry", "student_group")
+
+
+@admin.register(AuditEvent)
+class AuditEventAdmin(admin.ModelAdmin):
+    """The audit trail, readable and immutable - including from the admin.
+
+    Adding, changing and deleting are all refused, and the model exposes no delete
+    endpoint anywhere: an audit record that an administrator can edit is not evidence.
+    The queryset is served read-only through ``has_*_permission`` overrides, so the admin
+    cannot be used as a back door around that rule.
+    """
+
+    list_display = (
+        "created_at",
+        "action",
+        "actor_username_snapshot",
+        "actor_role_snapshot",
+        "department",
+        "object_type",
+        "object_id",
+    )
+    list_filter = ("action", "actor_role_snapshot", "department")
+    search_fields = ("actor_username_snapshot", "object_id", "request_id")
+    list_select_related = ("actor", "department", "semester", "schedule")
+    readonly_fields = (
+        "id",
+        "created_at",
+        "action",
+        "actor",
+        "actor_username_snapshot",
+        "actor_role_snapshot",
+        "department",
+        "semester",
+        "schedule",
+        "schedule_version",
+        "object_type",
+        "object_id",
+        "request_id",
+        "metadata",
+    )
+    ordering = ("-created_at", "-id")
+
+    def has_add_permission(self, request) -> bool:
+        return False
+
+    def has_change_permission(self, request, obj=None) -> bool:
+        return False
+
+    def has_delete_permission(self, request, obj=None) -> bool:
+        return False
+
+    def get_actions(self, request):
+        """No bulk actions, so no bulk deletion is reachable from the admin."""
+        return {}

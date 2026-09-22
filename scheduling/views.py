@@ -11,6 +11,7 @@ from dataclasses import replace
 
 from django.db.models import Count, OuterRef, Subquery
 from django.http import HttpResponse
+from django.utils.dateparse import parse_datetime
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import OpenApiParameter, OpenApiResponse, extend_schema
 from rest_framework import status
@@ -32,6 +33,8 @@ from academics.views import AcademicStructureViewSet, DepartmentVisibilityQuerys
 from academics.models import Department, Semester
 from resources.views import QueryParameterFilterMixin
 from scheduling.models import (
+    AuditAction,
+    AuditEvent,
     BreakPeriod,
     CalendarException,
     Schedule,
@@ -45,6 +48,7 @@ from scheduling.permissions import (
     CanEditScheduleDraft,
     CanImportSemesterPlan,
     CanManageCalendarExceptions,
+    CanReadAuditEvents,
     CanReadPublishedAnalytics,
     CanReadScheduleData,
     CanRunCollegeScheduleGeneration,
@@ -52,10 +56,12 @@ from scheduling.permissions import (
     CanRunScheduleWorkflow,
     resolve_import_department,
     resolve_validation_scope,
+    visible_audit_events_filter,
     visible_calendar_exceptions_filter,
     visible_schedules_filter,
 )
 from scheduling.serializers import (
+    AuditEventSerializer,
     BreakPeriodSerializer,
     BreakPeriodWriteSerializer,
     CalendarExceptionSerializer,
@@ -138,6 +144,7 @@ from scheduling.services.workflow import (
 
 CALENDAR_TAGS = ["calendar"]
 SCHEDULING_TAGS = ["scheduling"]
+OPERATIONS_TAGS = ["operations"]
 
 
 @extend_schema(tags=CALENDAR_TAGS)
@@ -1872,3 +1879,220 @@ class SemesterPlanApplyView(_SemesterPlanImportView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         return Response(SemesterPlanApplyResponseSerializer(body).data)
+
+
+# --- Phase 16: audit trail read API ------------------------------------------
+
+
+class AuditEventViewSet(ReadOnlyModelViewSet):
+    """Read-only audit events, newest first.
+
+    The trail is written by the services that perform the operations; this viewset only
+    reads it. Ordering is ``-created_at, -id``: creation time with the event id as a
+    deterministic tie-breaker for events written inside one transaction.
+
+    Access is scoped before filtering. A college administrator reads every event; a
+    department administrator reads only the events attributed to its own department, so a
+    college-wide operation - which stores no department - is invisible to it. Filtering
+    with a foreign ``department`` therefore cannot widen anything: it simply matches
+    nothing.
+    """
+
+    serializer_class = AuditEventSerializer
+    permission_classes = [IsAuthenticated, CanReadAuditEvents]
+    #: Declared for schema generation only (it is what tells drf-spectacular the path
+    #: parameter is a UUID); every read uses the scoped queryset from ``get_queryset``.
+    queryset = AuditEvent.objects.all()
+    #: Only reads exist. A write verb answers 405 instead of creating a trail row.
+    http_method_names = ["get", "head", "options"]
+
+    def get_queryset(self):
+        queryset = (
+            AuditEvent.objects.filter(visible_audit_events_filter(self.request.user))
+            .select_related(
+                "actor",
+                "department",
+                "semester",
+                "schedule",
+                "schedule_version",
+            )
+            .order_by("-created_at", "-id")
+        )
+        return _filter_audit_events(queryset, self.request.query_params)
+
+    @extend_schema(
+        tags=OPERATIONS_TAGS,
+        summary="List audit events",
+        description=(
+            "Returns the audit trail this caller may read, newest first. Every event "
+            "describes one successful, security- or operations-significant scheduling "
+            "operation: a stored draft generation, an applied manual edit, a workflow "
+            "stage change or an applied semester teaching plan import.\n\n"
+            "Reads, validation-only calls, previews, analytics and export downloads are "
+            "never audited. Failed and rolled-back operations leave no event, because the "
+            "event is written inside the transaction of the operation it describes.\n\n"
+            "A college administrator reads every event. A department administrator reads "
+            "the events attributed to its own department: college-wide operations carry no "
+            "department, so they are not visible to it. ``SCHEDULER``, ``VIEWER`` and "
+            "``INSTRUCTOR`` are refused with ``403``.\n\n"
+            "Filters: ``action``, ``department``, ``semester``, ``schedule``, "
+            "``schedule_version``, ``actor``, ``created_after``, ``created_before``. They "
+            "narrow the authorized scope and can never widen it."
+        ),
+        parameters=[
+            OpenApiParameter(
+                name="action",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="Audit action, for example SCHEDULE_PUBLISHED.",
+            ),
+            OpenApiParameter(
+                name="department",
+                type=int,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="Department id the operation belonged to.",
+            ),
+            OpenApiParameter(
+                name="semester",
+                type=int,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="Semester id the operation belonged to.",
+            ),
+            OpenApiParameter(
+                name="schedule",
+                type=int,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="Schedule id the operation belonged to.",
+            ),
+            OpenApiParameter(
+                name="schedule_version",
+                type=int,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="Schedule version id the operation produced or changed.",
+            ),
+            OpenApiParameter(
+                name="actor",
+                type=int,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="User id of the actor.",
+            ),
+            OpenApiParameter(
+                name="created_after",
+                type=OpenApiTypes.DATETIME,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="Only events created at or after this timestamp.",
+            ),
+            OpenApiParameter(
+                name="created_before",
+                type=OpenApiTypes.DATETIME,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="Only events created at or before this timestamp.",
+            ),
+        ],
+        responses={
+            200: AuditEventSerializer(many=True),
+            400: OpenApiResponse(description="Unknown filter value."),
+            401: OpenApiResponse(description="Authentication required."),
+            403: OpenApiResponse(
+                description=(
+                    "This role may not read the audit trail: only college administrators "
+                    "and department administrators may."
+                )
+            ),
+        },
+    )
+    def list(self, request, *args, **kwargs):
+        return super().list(request, *args, **kwargs)
+
+    @extend_schema(
+        tags=OPERATIONS_TAGS,
+        summary="Read one audit event",
+        description=(
+            "Returns one audit event. An event outside the caller's scope answers ``404`` "
+            "rather than disclosing that it exists."
+        ),
+        responses={
+            200: AuditEventSerializer,
+            401: OpenApiResponse(description="Authentication required."),
+            403: OpenApiResponse(description="This role may not read the audit trail."),
+            404: OpenApiResponse(
+                description="Unknown event, or an event outside the caller's scope."
+            ),
+        },
+    )
+    def retrieve(self, request, *args, **kwargs):
+        return super().retrieve(request, *args, **kwargs)
+
+
+def _filter_audit_events(queryset, params):
+    """Apply the documented, safe audit filters on top of the authorized scope.
+
+    Every filter is validated: an unknown action, an unknown object id or a malformed
+    timestamp is a ``400`` rather than a silently ignored filter, because a quietly
+    dropped boundary would misrepresent the trail.
+    """
+    action = params.get("action")
+    if action:
+        if action not in AuditAction.values:
+            raise DRFValidationError(
+                {
+                    "action": (
+                        f"Unknown action. Known values: {', '.join(AuditAction.values)}."
+                    )
+                }
+            )
+        queryset = queryset.filter(action=action)
+
+    lookups = (
+        ("department", Department, "department"),
+        ("semester", Semester, "semester"),
+        ("schedule", Schedule, "schedule"),
+        ("schedule_version", ScheduleVersion, "schedule_version"),
+        ("actor", None, "actor"),
+    )
+    for name, model, field in lookups:
+        raw = params.get(name)
+        if not raw:
+            continue
+        try:
+            value = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise DRFValidationError({name: "Use a numeric id."}) from exc
+        if model is not None and not model.objects.filter(pk=value).exists():
+            raise DRFValidationError({name: f"Unknown {name}."})
+        queryset = queryset.filter(**{f"{field}_id": value})
+
+    for name, lookup in (
+        ("created_after", "created_at__gte"),
+        ("created_before", "created_at__lte"),
+    ):
+        raw = params.get(name)
+        if not raw:
+            continue
+        try:
+            parsed = _parse_filter_timestamp(raw)
+        except ValueError as exc:
+            raise DRFValidationError(
+                {name: "Use an ISO-8601 timestamp, for example 2026-09-21T12:00:00."}
+            ) from exc
+        queryset = queryset.filter(**{lookup: parsed})
+    return queryset
+
+
+def _parse_filter_timestamp(raw: str):
+    """Parse an ISO-8601 audit filter value, accepting a trailing ``Z``."""
+    value = str(raw).strip()
+    if value.endswith("Z"):
+        value = f"{value[:-1]}+00:00"
+    parsed = parse_datetime(value)
+    if parsed is None:
+        raise ValueError(value)
+    return parsed
