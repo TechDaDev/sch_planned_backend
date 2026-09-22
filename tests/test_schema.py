@@ -22,7 +22,35 @@ def test_schema_reports_api_metadata(api_client):
     assert response.status_code == 200
     info = response.json()["info"]
     assert info["title"] == "College Academic Schedule Planner API"
-    assert info["version"] == "0.1.0"
+    # Phase 17 promotes the schema to the release-candidate version.
+    assert info["version"] == "1.0.0"
+
+
+def test_schema_is_the_only_public_surface_besides_health_and_auth(api_client):
+    """Route inventory: only health, login and refresh are unauthenticated.
+
+    Any other endpoint that loses its authentication requirement is a release blocker, so
+    the inventory is asserted rather than reviewed by eye.
+    """
+    response = api_client.get(SCHEMA_URL, {"format": "json"})
+    paths = response.json()["paths"]
+
+    public, protected = [], []
+    for path, operations in paths.items():
+        for method, operation in operations.items():
+            if method not in {"get", "post", "put", "patch", "delete"}:
+                continue
+            target = public if is_public_operation(operation) else protected
+            target.append(f"{method.upper()} {path}")
+
+    assert sorted(public) == [
+        "GET /api/health/",
+        "GET /api/health/live/",
+        "GET /api/health/ready/",
+        "POST /api/auth/login/",
+        "POST /api/auth/refresh/",
+    ], sorted(public)
+    assert len(protected) > 50, len(protected)
 
 
 def test_schema_documents_health_endpoint(api_client):

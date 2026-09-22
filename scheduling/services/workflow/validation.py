@@ -218,6 +218,17 @@ class WorkflowVersionValidator:
                 "offering",
                 "offering__course",
                 "offering__managing_department",
+            ).prefetch_related(
+                # ``expected_student_count`` uses the ``attached_group_links`` prefetch
+                # when it exists, so loading it here keeps the capacity checks from
+                # issuing one aggregate query per entry.
+                Prefetch(
+                    "group_links",
+                    queryset=TeachingComponentGroup.objects.select_related(
+                        "student_group"
+                    ).order_by("student_group_id"),
+                    to_attr="attached_group_links",
+                )
             )
         }
         self._requirements = {
@@ -237,7 +248,14 @@ class WorkflowVersionValidator:
                     queryset=TeachingComponentCapabilityRequirement.objects.select_related(
                         "capability"
                     ).order_by("capability_id"),
-                )
+                ),
+                Prefetch(
+                    "teaching_component__group_links",
+                    queryset=TeachingComponentGroup.objects.select_related(
+                        "student_group"
+                    ).order_by("student_group_id"),
+                    to_attr="attached_group_links",
+                ),
             )
         }
         self._assignments = {component_id: set() for component_id in component_ids}

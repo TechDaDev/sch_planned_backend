@@ -1,23 +1,24 @@
 # College Academic Schedule Planner — Backend
 
 Django REST Framework backend for the College Academic Schedule Planner.
-Provides the project foundation (configuration package, domain app skeletons,
-custom user model, API/OpenAPI plumbing) that later phases build on.
 
-- Current phase: **Phase 16 — audit, backup and operational controls** (an append-only
-  scheduling audit trail, read-only operational integrity verification, and SQLite-only
-  backup/verify/restore management commands). Phase 17 will do the final
-  security/performance/release hardening.
+- **Backend release candidate `1.0.0`** (Phases 0-17 complete).
+- Current phase: **Phase 17 — final hardening and release candidate**. No new business
+  feature; production settings, health probes, API error hardening, documentation exposure,
+  release documentation.
+- Deployment preparation (PostgreSQL, containers, Railway) is **not** part of this
+  repository yet and starts only after the backend is accepted.
 
 ## Architecture
 
 ```
 sch_planner_backend/
 ├── config/            # Django project/configuration package
-│   ├── settings.py    # environment-driven settings
+│   ├── settings.py    # environment-driven settings (dev and production hardening)
 │   ├── urls.py        # root URLconf: /admin/ and /api/
-│   ├── api_urls.py    # /api/ namespace (health, app URLconfs, schema, docs)
-│   ├── views.py       # project-level API views (health probe)
+│   ├── api_urls.py    # /api/ namespace (health, app URLconfs, optional schema/docs)
+│   ├── views.py       # project-level API views (health, liveness, readiness)
+│   ├── exceptions.py  # generic JSON for unhandled API errors
 │   ├── asgi.py
 │   └── wsgi.py
 ├── accounts/          # custom user model, roles, permissions, auth API
@@ -76,6 +77,8 @@ sch_planner_backend/
 │                      # 0004_workflow_publication, 0005_audit_event
 ├── reports/           # reserved for later report artifacts (Phase 15 exports are
 │                      # generated on request in scheduling/services/exports/)
+├── docs/              # FINAL_BACKEND_ARCHITECTURE, BACKEND_RELEASE_CHECKLIST,
+│                      # POSTGRESQL_READINESS
 ├── tests/             # pytest suite for the whole project
 ├── manage.py
 ├── requirements.txt
@@ -2516,6 +2519,85 @@ Backup archives are self-describing, so a restore does not depend on the audit t
 no `AuditEvent` is written by a restore: replacing the database would give that record
 ambiguous semantics.
 
+## Release hardening (Phase 17)
+
+The backend is a release candidate: `1.0.0` in the OpenAPI schema. No business feature was
+added. What changed is what surrounds the features.
+
+### Health probes
+
+| Endpoint | Auth | Behavior |
+| --- | --- | --- |
+| `GET /api/health/` | public | unchanged Phase 0 probe (`status`, `service`) |
+| `GET /api/health/live/` | public | liveness. Performs **no** database query, because a process that cannot reach its database is still alive |
+| `GET /api/health/ready/` | public | readiness. One `SELECT 1`: `200 {"status":"ok"}`, or `503 {"status":"unavailable"}` |
+
+None of them reports a path, host, vendor, version or exception text, and none mutates
+anything. They are three of only five public operations in the whole API — the others are
+`POST /api/auth/login/` and `POST /api/auth/refresh/`, and that complete inventory is
+asserted by a test rather than reviewed by eye.
+
+### Errors and logging
+
+Documented DRF errors (`400`, `401`, `403`, `404`, `405`, `409`, `415`, `429`) keep the
+responses they always had. An **unhandled** exception is answered with generic JSON:
+
+```json
+{
+  "detail": "Internal server error.",
+  "code": "INTERNAL_SERVER_ERROR",
+  "request_id": "6f1c9a4e2b7d4f0e8c3a5b1d9e7f2a4c"
+}
+```
+
+and logged server-side with `logger.exception` plus the request id, HTTP method, path,
+authenticated user id and the debug flag. No exception class, message, traceback, SQL,
+filesystem path or environment value reaches the client. The request id comes from the
+Phase 16 middleware: sanitized, capped at 64 characters, generated when the incoming
+header is unusable, echoed back in `X-Request-ID`, and never used for authorization.
+
+### Development and production settings
+
+One settings module, environment-driven. `DJANGO_DEBUG=true` keeps the local workflow
+exactly as it was: localhost allowed, local frontend origins allowed, docs and the
+browsable API available, SQLite by default.
+
+With `DJANGO_DEBUG=false` the settings fail closed instead of guessing:
+
+- `DJANGO_SECRET_KEY` becomes mandatory (no development fallback);
+- `DJANGO_ALLOWED_HOSTS` becomes mandatory (no `localhost`, no wildcard);
+- CORS starts empty, `CORS_ALLOW_ALL_ORIGINS` stays `False`, and credentials stay off
+  because authentication is a bearer token;
+- `DJANGO_CSRF_TRUSTED_ORIGINS` starts empty;
+- `SECURE_SSL_REDIRECT`, secure session/CSRF cookies, `SECURE_CONTENT_TYPE_NOSNIFF`,
+  `SESSION_COOKIE_HTTPONLY`, `SameSite=Lax`, `X_FRAME_OPTIONS=DENY` and
+  `SECURE_HSTS_SECONDS=3600` are enabled;
+- HSTS subdomains and preload stay **off** until deliberately enabled: both are
+  effectively irreversible for a browser and this repository does not know the hostnames;
+- `/api/schema/` and `/api/docs/` are not registered, so they answer an ordinary `404`.
+  `python manage.py spectacular` keeps working in either mode;
+- `SECURE_PROXY_SSL_HEADER` is set only when `DJANGO_TRUST_X_FORWARDED_PROTO=true`, so
+  proxy headers are never trusted by default.
+
+Every one of these is covered by tests that start a fresh interpreter, because the checks
+run at import time. See `docs/BACKEND_RELEASE_CHECKLIST.md` for the command-level
+checklist and the one intentional `check --deploy` warning (HSTS preload).
+
+### Repository and dependency hygiene
+
+`python -m pip check` reports no broken requirements, `requirements.txt` stays explicitly
+pinned (no transitive dump), `python -m compileall` compiles every application package, and
+no `.env`, database, backup archive, export or temporary harness is tracked. `.env.example`
+contains placeholders only.
+
+### Documentation
+
+| Document | Purpose |
+| --- | --- |
+| `docs/FINAL_BACKEND_ARCHITECTURE.md` | layer model, package map, the five invariants, operational tooling |
+| `docs/BACKEND_RELEASE_CHECKLIST.md` | gate commands, environment variables, deployment prerequisites, known observations |
+| `docs/POSTGRESQL_READINESS.md` | static portability review, `select_for_update` semantics, backup boundary, what runtime verification must cover |
+
 ## Who may write what
 
 | Role | Reads | Writes |
@@ -2586,6 +2668,12 @@ Settings are read from environment variables (optionally via `.env`):
 | `DJANGO_SEMESTER_PLAN_IMPORT_MAX_TOTAL_ROWS` | `10000`                           |
 | `DJANGO_SEMESTER_PLAN_IMPORT_MAX_SCANNED_ROWS` | `20000`                         |
 | `DJANGO_LOCAL_BACKUP_DIR` | `<project>/var/backups` (git-ignored, created `0700`) |
+| `DJANGO_API_DOCS_ENABLED` | `true` in development, `false` in production |
+| `DJANGO_CSRF_TRUSTED_ORIGINS` | empty (fail-closed in both environments) |
+| `DJANGO_SECURE_SSL_REDIRECT`, `DJANGO_SESSION_COOKIE_SECURE`, `DJANGO_CSRF_COOKIE_SECURE` | `false` in development, `true` in production |
+| `DJANGO_SECURE_HSTS_SECONDS` | `0` in development, `3600` in production |
+| `DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS`, `DJANGO_SECURE_HSTS_PRELOAD` | `false` everywhere until deliberately enabled |
+| `DJANGO_TRUST_X_FORWARDED_PROTO` | unset; set only behind a trusted reverse proxy |
 
 Other fixed settings: `AUTH_USER_MODEL = "accounts.User"`,
 `TIME_ZONE = "Asia/Baghdad"`, `USE_I18N = True`, `USE_TZ = True`, SQLite via
@@ -2640,9 +2728,12 @@ not used.
 - **Phase 16 (done)** — audit, backup and operational controls: an append-only audit
 trail over successful scheduling mutations, a read-only operational integrity command,
 and SQLite-only local backup/verify/restore tooling.
-- **Phase 17 (planned)** — final security, performance and release hardening, and
-deployment preparation (including the PostgreSQL/Railway backup strategy that Phase 16
-deliberately leaves out).
+- **Phase 17 (done)** — final hardening and release candidate: production-safe settings,
+  liveness/readiness probes, generic 500 handling with server-side logging, documentation
+  exposure control, dependency and repository hygiene, PostgreSQL portability review, and
+  the architecture/release/readiness documentation.
+- **Next** — independent backend acceptance, then deployment preparation (PostgreSQL,
+  container, Railway), then the Flutter instructor app and further phases.
 - **Later** — reservations and department regeneration from an authoritative version,
   PostgreSQL, background jobs, Railway deployment.
 - **Flutter instructor app** — after the web application, using
